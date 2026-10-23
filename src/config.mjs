@@ -18,6 +18,9 @@ const DEFAULTS = {
   },
   // Chat history search (mcp/chat-history.mjs) reads at most this many messages back from QQ per search.
   history: { maxScanMessages: 1000 },
+  // mode: "separate" gives every group and private chat its own context and memory; "global" makes them all
+  // share one context, one memory and one queue, handled strictly one batch at a time.
+  conversation: { mode: 'separate' },
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
   dataDir: 'data', // long-term memory files only; chat history stays in QQ
   mcpServers: {},
@@ -49,6 +52,9 @@ export function loadConfig(path) {
   config.group.allow = config.group.allow.map(String);
   config.private.allow = config.private.allow.map(String);
 
+  if (!['separate', 'global'].includes(config.conversation.mode)) {
+    throw new Error(`conversation.mode must be "separate" or "global", got ${JSON.stringify(config.conversation.mode)}`);
+  }
   if (!['auto', 'mention'].includes(config.group.reply)) {
     throw new Error(`group.reply must be "auto" or "mention", got ${JSON.stringify(config.group.reply)}`);
   }

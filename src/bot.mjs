@@ -1,5 +1,5 @@
 // Decides what happens to each incoming message: batch it, ask the model, and reply (or stay silent).
-import { clipTail, compressIfNeeded, contextLine, Conversation, rebuildContext, trimContext } from './conversation.mjs';
+import { assistantLine, Chat, clipTail, compressIfNeeded, contextLine, rebuildContext, Thread, trimContext } from './conversation.mjs';
 import { recentRecords } from './history.mjs';
 import { Llm } from './llm.mjs';
 import { downloadImage, imageUrls, isMentioned, plainText, render, replyId } from './message.mjs';
@@ -9,6 +9,8 @@ export const NO_REPLY = '[NO_REPLY]';
 const RESET_COMMANDS = new Set(['/reset', '/重置']);
 // Statuses with which providers reject a request itself, most often because it is longer than the model accepts.
 const REJECTED = new Set([400, 413, 422]);
+// In global mode the model sometimes copies the "[group-123]" label it sees on every line; it is not meant to be sent.
+const LEADING_LABEL = /^\s*\[(?:group|private)-\d+\]\s*/;
 
 // The newest `max` messages, always including the latest @-mention.
 function limitBatch(messages, mention, max) {
@@ -25,7 +27,9 @@ export class Bot {
     this.tools = tools;
     this.onebot = onebot;
     this.llm = new Llm(config.llm);
-    this.conversations = new Map();
+    this.global = config.conversation.mode === 'global';
+    this.chats = new Map();
+    this.threads = new Map();
     this.groupAllow = new Set(config.group.allow);
     this.privateAllow = new Set(config.private.allow);
   }
@@ -41,48 +45,58 @@ export class Bot {
 
   onEvent(ev) {
     if (!this.accepts(ev)) return;
-    const conv = this.conversation(ev);
-    conv.intake = conv.intake.then(() => this.receive(conv, ev)).catch((e) => console.error(`${conv.key}: ${e.stack || e}`));
+    const chat = this.chat(ev);
+    chat.intake = chat.intake.then(() => this.receive(chat, ev)).catch((e) => console.error(`${chat.key}: ${e.stack || e}`));
   }
 
-  conversation(ev) {
+  chat(ev) {
     const isGroup = ev.message_type === 'group';
     const targetId = isGroup ? ev.group_id : ev.user_id;
     const key = `${isGroup ? 'group' : 'private'}-${targetId}`;
-    if (!this.conversations.has(key)) {
-      const conv = new Conversation(key, { isGroup, targetId }, this.memoryStore);
-      conv.restored = this.restore(conv, ev);
-      this.conversations.set(key, conv);
+    if (!this.chats.has(key)) {
+      const chat = new Chat(key, { isGroup, targetId }, this.thread(key, isGroup));
+      chat.restored = this.restore(chat, ev);
+      this.chats.set(key, chat);
     }
-    return this.conversations.get(key);
+    return this.chats.get(key);
   }
 
-  // The first time a conversation is seen (e.g. after a restart), start from its latest messages in QQ.
-  async restore(conv, firstEvent) {
+  thread(chatKey, isGroup) {
+    const key = this.global ? 'global' : chatKey;
+    if (!this.threads.has(key)) {
+      this.threads.set(key, new Thread(key, this.memoryStore, { labelled: this.global, isPrivate: !this.global && !isGroup }));
+    }
+    return this.threads.get(key);
+  }
+
+  // The first time a chat is seen (e.g. after a restart), add its latest messages from QQ to the context.
+  async restore(chat, firstEvent) {
     const { keepRecentMessages, maxMessageChars, maxContextChars } = this.config.memory;
+    let restored;
     try {
-      const records = await recentRecords(this.onebot, conv.key, keepRecentMessages, firstEvent);
-      conv.context = rebuildContext(records, conv.isGroup, maxMessageChars);
-      trimContext(conv, keepRecentMessages, maxContextChars / 2);
+      restored = { context: rebuildContext(await recentRecords(this.onebot, chat.key, keepRecentMessages, firstEvent), chat, maxMessageChars) };
+      trimContext(restored, keepRecentMessages, maxContextChars / 2);
     } catch (e) {
-      console.error(`${conv.key}: could not load recent history from NapCat: ${e.message}`);
+      console.error(`${chat.key}: could not load recent history from NapCat: ${e.message}`);
+      return;
     }
+    await chat.thread.run(() => chat.thread.context.push(...restored.context));
   }
 
-  async receive(conv, ev) {
-    await conv.restored;
+  async receive(chat, ev) {
+    await chat.restored;
     const msg = await this.describe(ev);
     if (!msg.text) return;
 
-    if (RESET_COMMANDS.has(msg.plain) && (!conv.isGroup || msg.mentioned)) {
-      return conv.run(() => {
-        conv.context = [];
-        conv.pending = [];
-        this.reply(conv, '上下文已清空。', msg.id, { remember: false });
+    if (RESET_COMMANDS.has(msg.plain) && (!chat.isGroup || msg.mentioned)) {
+      return chat.thread.run(() => {
+        chat.thread.context = [];
+        chat.pending = [];
+        this.reply(chat, '上下文已清空。', msg.id, { remember: false });
       });
     }
-    conv.pending.push(msg);
-    this.schedule(conv, !conv.isGroup || msg.mentioned);
+    chat.pending.push(msg);
+    this.schedule(chat, !chat.isGroup || msg.mentioned);
   }
 
   // A message as the model will read it, including what it replies to (fetched with get_msg).
@@ -116,40 +130,42 @@ export class Bot {
   }
 
   // Group messages are collected until the chat has been quiet for debounceSeconds (at most maxWaitSeconds);
-  // private messages and @-mentions are handled right away.
-  schedule(conv, immediate) {
+  // private messages and @-mentions are handled right away. Either way the batch then waits its turn on the
+  // chat's thread, which handles one batch at a time.
+  schedule(chat, immediate) {
     const { debounceSeconds, maxWaitSeconds } = this.config.group;
     const now = Date.now();
-    if (!conv.firstPendingAt) conv.firstPendingAt = now;
-    const delay = immediate ? 0 : Math.max(0, Math.min(debounceSeconds * 1000, conv.firstPendingAt + maxWaitSeconds * 1000 - now));
-    clearTimeout(conv.timer);
-    conv.timer = setTimeout(() => conv.run(() => this.flush(conv)), delay);
+    if (!chat.firstPendingAt) chat.firstPendingAt = now;
+    const delay = immediate ? 0 : Math.max(0, Math.min(debounceSeconds * 1000, chat.firstPendingAt + maxWaitSeconds * 1000 - now));
+    clearTimeout(chat.timer);
+    chat.timer = setTimeout(() => chat.thread.run(() => this.flush(chat)), delay);
   }
 
-  async flush(conv) {
-    const pending = conv.pending.splice(0);
-    conv.firstPendingAt = 0;
+  async flush(chat) {
+    const pending = chat.pending.splice(0);
+    chat.firstPendingAt = 0;
     if (!pending.length) return;
     const { memory, group } = this.config;
+    const { thread } = chat;
 
     // A burst (e.g. while the previous request was running) is cut to the newest messages; the rest stay in QQ.
     const mention = pending.findLast((m) => m.mentioned);
     const batch = limitBatch(pending, mention, memory.maxBatchMessages);
-    const lines = batch.map((m) => contextLine(conv.isGroup, m, memory.maxMessageChars));
+    const lines = batch.map((m) => contextLine(chat, m, memory.maxMessageChars));
     const omitted = pending.length - batch.length;
     if (omitted) {
       lines.unshift(`（期间还有 ${omitted} 条较早的消息已省略${this.tools.definitions.length ? '，需要时可以搜索聊天记录' : ''}）`);
     }
-    conv.context.push({ role: 'user', content: clipTail(lines.join('\n'), memory.maxContextChars / 2) });
+    thread.context.push({ role: 'user', content: clipTail(lines.join('\n'), memory.maxContextChars / 2) });
 
-    const mustReply = !conv.isGroup || Boolean(mention);
-    if (!mustReply && group.reply === 'mention') return this.compress(conv); // just listen
+    const mustReply = !chat.isGroup || Boolean(mention);
+    if (!mustReply && group.reply === 'mention') return this.compress(thread); // just listen
 
     const images = await this.loadImages(batch);
     let reply;
     let error;
     try {
-      reply = await this.ask(conv, images);
+      reply = await this.ask(chat, images);
     } catch (e) {
       error = e;
     }
@@ -159,27 +175,28 @@ export class Bot {
     const fallbacks = [[memory.keepRecentMessages, memory.maxContextChars / 4], [1, memory.maxMessageChars]];
     for (const [keep, budget] of fallbacks) {
       if (!REJECTED.has(error?.status)) break;
-      console.error(`${conv.key}: request rejected (${error.message}), retrying with a shorter context`);
-      trimContext(conv, keep, budget);
+      console.error(`${chat.key}: request rejected (${error.message}), retrying with a shorter context`);
+      trimContext(thread, keep, budget);
       error = undefined;
       try {
-        reply = await this.ask(conv, images);
+        reply = await this.ask(chat, images);
       } catch (e) {
         error = e;
       }
     }
 
-    const quote = conv.isGroup ? mention?.id : batch.at(-1).id;
+    if (this.global && reply) reply = reply.replace(LEADING_LABEL, '');
+    const quote = chat.isGroup ? mention?.id : batch.at(-1).id;
     if (error) {
-      console.error(`LLM request failed for ${conv.key}: ${error.message}`);
-      if (!conv.isGroup) conv.context.pop(); // so the user can simply ask again
-      if (mustReply) this.reply(conv, `出错了：${error.message}`, quote, { remember: false });
-    } else if (conv.isGroup && (!reply || reply.includes(NO_REPLY))) {
+      console.error(`LLM request failed for ${chat.key}: ${error.message}`);
+      if (!chat.isGroup) thread.context.pop(); // so the user can simply ask again
+      if (mustReply) this.reply(chat, `出错了：${error.message}`, quote, { remember: false });
+    } else if (chat.isGroup && (!reply || reply.includes(NO_REPLY))) {
       // the model chose silence
     } else {
-      this.reply(conv, reply || '（空回复）', quote);
+      this.reply(chat, reply || '（空回复）', quote);
     }
-    await this.compress(conv);
+    await this.compress(thread);
   }
 
   // The batch's images, downloaded for inlining when vision is enabled.
@@ -198,51 +215,62 @@ export class Bot {
   }
 
   // Asks the model about the newest context entry, with this turn's images attached.
-  ask(conv, { dataUrls, note }) {
-    const text = conv.context.at(-1).content + note;
+  ask(chat, { dataUrls, note }) {
+    const text = chat.thread.context.at(-1).content + note;
     const content = dataUrls.length
       ? [{ type: 'text', text }, ...dataUrls.map((url) => ({ type: 'image_url', image_url: { url } }))]
       : text;
-    return this.llm.complete(this.messages(conv, content), {
+    return this.llm.complete(this.messages(chat, content), {
       tools: this.tools.definitions,
-      onToolCall: (name, args) => this.tools.call(name, args, { conversation: conv.key }),
+      onToolCall: (name, args) => this.tools.call(name, args, { conversation: chat.key }),
     });
   }
 
   // The context holds text only; this turn's entry is swapped for the version carrying images.
-  messages(conv, content) {
-    return [{ role: 'system', content: this.systemPrompt(conv) }, ...conv.context.slice(0, -1), { role: 'user', content }];
+  messages(chat, content) {
+    return [{ role: 'system', content: this.systemPrompt(chat) }, ...chat.thread.context.slice(0, -1), { role: 'user', content }];
   }
 
-  systemPrompt(conv) {
+  systemPrompt(chat) {
     const { bot, group, timezone } = this.config;
     const lines = [bot.systemPrompt];
     if (bot.name) lines.push(`你的名字是「${bot.name}」。`);
     lines.push(`当前时间：${formatTime(Date.now(), timezone)}（${timezone}）。`);
-    if (conv.isGroup) {
-      lines.push(`你在 QQ 群 ${conv.targetId} 里（会话 ID：${conv.key}）。群消息的格式是"昵称(QQ号)：内容"，"@你"表示有人提到了你。你每次看到的是一批新消息。`);
-      if (group.reply === 'auto') {
-        lines.push(`只有在有人 @ 你、叫你的名字、明确向你提问，或者你确实有很有价值的内容可以补充时才发言；被 @ 时一定要回复。其他情况只输出 ${NO_REPLY}，不要输出任何别的内容。`);
-      }
-      lines.push('发言时直接说你要说的话，不要加"昵称："这样的前缀。');
+    const where = chat.isGroup ? `QQ 群 ${chat.targetId}` : `和 QQ 用户 ${chat.targetId} 的私聊`;
+    if (this.global) {
+      lines.push('你同时在多个 QQ 群和私聊里，所有对话共用这一份上下文。每条消息前的 [group-群号] 表示来自哪个群，[private-QQ号] 表示私聊；'
+        + '格式是"[会话 ID] 昵称(QQ号)：内容"，"@你"表示有人提到了你。你每次看到的是某一个会话里的一批新消息。');
+      lines.push(`这批新消息来自 [${chat.key}]（${where}），你的回复只会发到那里。`);
+    } else if (chat.isGroup) {
+      lines.push(`你在 QQ 群 ${chat.targetId} 里（会话 ID：${chat.key}）。群消息的格式是"昵称(QQ号)：内容"，"@你"表示有人提到了你。你每次看到的是一批新消息。`);
     } else {
-      lines.push(`你正在和 QQ 用户 ${conv.targetId} 私聊（会话 ID：${conv.key}）。`);
+      lines.push(`你正在和 QQ 用户 ${chat.targetId} 私聊（会话 ID：${chat.key}）。`);
     }
-    if (conv.memory) lines.push(`以下是你对这个会话的长期记忆（由较早的聊天整理而来）：\n${conv.memory}`);
+    if (chat.isGroup && group.reply === 'auto') {
+      lines.push(`只有在有人 @ 你、叫你的名字、明确向你提问，或者你确实有很有价值的内容可以补充时才发言；被 @ 时一定要回复。其他情况只输出 ${NO_REPLY}，不要输出任何别的内容。`);
+    }
+    if (this.global) lines.push('发言时直接说你要说的话，不要加"[会话 ID]"标签或"昵称："这样的前缀。');
+    else if (chat.isGroup) lines.push('发言时直接说你要说的话，不要加"昵称："这样的前缀。');
+    const { memory } = chat.thread;
+    if (memory) {
+      lines.push(this.global
+        ? `以下是你的长期记忆（由所有群和私聊的较早聊天整理而来）：\n${memory}`
+        : `以下是你对这个会话的长期记忆（由较早的聊天整理而来）：\n${memory}`);
+    }
     return lines.join('\n');
   }
 
-  reply(conv, text, quoteId, { remember = true } = {}) {
+  reply(chat, text, quoteId, { remember = true } = {}) {
     const message = [
       ...(quoteId != null ? [{ type: 'reply', data: { id: String(quoteId) } }] : []),
       { type: 'text', data: { text } },
     ];
-    const target = conv.isGroup ? { group_id: conv.targetId } : { user_id: conv.targetId };
-    this.onebot.send(conv.isGroup ? 'send_group_msg' : 'send_private_msg', { ...target, message });
-    if (remember) conv.context.push({ role: 'assistant', content: text });
+    const target = chat.isGroup ? { group_id: chat.targetId } : { user_id: chat.targetId };
+    this.onebot.send(chat.isGroup ? 'send_group_msg' : 'send_private_msg', { ...target, message });
+    if (remember) chat.thread.context.push({ role: 'assistant', content: assistantLine(chat, text) });
   }
 
-  compress(conv) {
-    return compressIfNeeded(conv, { llm: this.llm, memory: this.config.memory, memoryStore: this.memoryStore });
+  compress(thread) {
+    return compressIfNeeded(thread, { llm: this.llm, memory: this.config.memory, memoryStore: this.memoryStore });
   }
 }

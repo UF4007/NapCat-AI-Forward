@@ -1,24 +1,38 @@
-// Per-conversation state: short-term context, messages waiting to be handled, and long-term memory.
+// Conversation state, in two layers:
+//   Chat    one QQ group or private chat: incoming messages wait there to be batched, and replies go back to it.
+//   Thread  what the model sees: short-term context, long-term memory, and the queue that handles one batch at a
+//           time. With conversation.mode "separate" every chat has its own thread; with "global" all chats share one.
 // Context entries are { role, content } with string content; their total size is kept within the memory limits.
 
-export class Conversation {
-  constructor(key, { isGroup, targetId }, memoryStore) {
-    this.key = key;
-    this.isGroup = isGroup;
-    this.targetId = targetId; // group_id or user_id
-    this.pending = []; // described messages not yet handled
-    this.firstPendingAt = 0;
-    this.timer = null;
-    this.intake = Promise.resolve(); // keeps incoming messages in arrival order
-    this.tail = Promise.resolve(); // serialises flushes, so replies keep their order
+export class Thread {
+  // labelled: several chats share this thread, so every line names its chat ("[group-123] …").
+  constructor(key, memoryStore, { labelled, isPrivate }) {
+    this.key = key; // memory file name: "group-<id>", "private-<id>" or "global"
+    this.labelled = labelled;
+    this.isPrivate = isPrivate; // a separate private chat: lines carry no speaker, so the transcript adds one
     this.memory = memoryStore.read(key);
-    this.context = []; // filled from QQ history when the conversation is first seen (see Bot.restore)
+    this.context = []; // filled from QQ history as chats are first seen (see Bot.restore)
+    this.tail = Promise.resolve();
   }
 
   run(fn) {
     const run = this.tail.then(fn);
     this.tail = run.catch((e) => console.error(`${this.key}: ${e.stack || e}`));
     return run;
+  }
+}
+
+export class Chat {
+  constructor(key, { isGroup, targetId }, thread) {
+    this.key = key; // "group-<id>" or "private-<id>"
+    this.isGroup = isGroup;
+    this.targetId = targetId; // group_id or user_id
+    this.thread = thread;
+    this.pending = []; // described messages not yet handled
+    this.firstPendingAt = 0;
+    this.timer = null;
+    this.intake = Promise.resolve(); // keeps incoming messages in arrival order
+    this.restored = Promise.resolve(); // recent history loaded when the chat is first seen
   }
 }
 
@@ -30,21 +44,25 @@ export const clipTail = (text, max) => (text.length <= max ? text : `…（前�
 export const contextChars = (context) => context.reduce((n, m) => n + m.content.length, 0);
 
 // How one incoming message reads in the context; very long messages are cut (QQ keeps them whole).
-export const contextLine = (isGroup, { name, userId, text }, maxChars) => {
+export function contextLine(chat, { name, userId, text }, maxChars) {
   const body = clipHead(text, maxChars);
-  return isGroup ? `${name}(${userId})：${body}` : body;
-};
+  if (chat.thread.labelled) return `[${chat.key}] ${name}(${userId})：${body}`;
+  return chat.isGroup ? `${name}(${userId})：${body}` : body;
+}
 
-// Context from history records ({ self, name, userId, text }, oldest first): the bot's own messages become
-// assistant turns, consecutive messages from others are joined into one user turn.
-export function rebuildContext(records, isGroup, maxMessageChars) {
+// How one of the bot's own messages reads in the context.
+export const assistantLine = (chat, text) => (chat.thread.labelled ? `[${chat.key}] ${text}` : text);
+
+// Context from one chat's history records ({ self, name, userId, text }, oldest first): the bot's own messages
+// become assistant turns, consecutive messages from others are joined into one user turn.
+export function rebuildContext(records, chat, maxMessageChars) {
   const context = [];
   for (const r of records) {
     if (r.self) {
-      context.push({ role: 'assistant', content: r.text });
+      context.push({ role: 'assistant', content: assistantLine(chat, r.text) });
       continue;
     }
-    const line = contextLine(isGroup, r, maxMessageChars);
+    const line = contextLine(chat, r, maxMessageChars);
     const last = context.at(-1);
     if (last?.role === 'user') last.content += `\n${line}`;
     else context.push({ role: 'user', content: line });
@@ -65,9 +83,10 @@ function recentCount(context, keep, budget) {
 }
 
 // Drops all but the newest entries that fit, and cuts the newest one if it alone is over budget.
-export function trimContext(conv, keep, budget) {
-  conv.context.splice(0, conv.context.length - recentCount(conv.context, keep, budget));
-  const last = conv.context.at(-1);
+// holder: anything with a `context` array (a thread, or a context being assembled).
+export function trimContext(holder, keep, budget) {
+  holder.context.splice(0, holder.context.length - recentCount(holder.context, keep, budget));
+  const last = holder.context.at(-1);
   if (last && last.content.length > budget) last.content = clipTail(last.content, budget);
 }
 
@@ -78,30 +97,30 @@ const compressPrompt = (maxChars) =>
 // When the context has more than memory.maxContextMessages entries or memory.maxContextChars characters, fold
 // everything but the newest entries (at most keepRecentMessages, within half the character budget) into the
 // memory file. If the model is unavailable this is retried next time, unless the context is twice over the
-// limits, in which case the oldest entries are dropped without a summary (they remain in the chat log).
-export async function compressIfNeeded(conv, { llm, memory, memoryStore }) {
-  const messages = conv.context.length;
-  const chars = contextChars(conv.context);
+// limits, in which case the oldest entries are dropped without a summary (they remain in QQ).
+export async function compressIfNeeded(thread, { llm, memory, memoryStore }) {
+  const messages = thread.context.length;
+  const chars = contextChars(thread.context);
   if (messages <= memory.maxContextMessages && chars <= memory.maxContextChars) return;
 
   const budget = memory.maxContextChars / 2;
-  const old = conv.context.slice(0, conv.context.length - recentCount(conv.context, memory.keepRecentMessages, budget));
+  const old = thread.context.slice(0, thread.context.length - recentCount(thread.context, memory.keepRecentMessages, budget));
   if (old.length) {
     const transcript = old
-      .map((m) => (m.role === 'assistant' ? `你：${m.content}` : conv.isGroup ? m.content : `对方：${m.content}`))
+      .map((m) => (m.role === 'assistant' ? `你：${m.content}` : thread.isPrivate ? `对方：${m.content}` : m.content))
       .join('\n');
     try {
       const summary = await llm.complete([
         { role: 'system', content: compressPrompt(memory.maxMemoryChars) },
-        { role: 'user', content: `已有记忆：\n${conv.memory || '（无）'}\n\n新的聊天记录：\n${clipTail(transcript, memory.maxContextChars)}` },
+        { role: 'user', content: `已有记忆：\n${thread.memory || '（无）'}\n\n新的聊天记录：\n${clipTail(transcript, memory.maxContextChars)}` },
       ]);
       if (!summary) throw new Error('the model returned an empty summary');
-      conv.memory = summary;
-      memoryStore.write(conv.key, summary);
+      thread.memory = summary;
+      memoryStore.write(thread.key, summary);
     } catch (e) {
-      console.error(`memory compression failed for ${conv.key}: ${e.message}`);
+      console.error(`memory compression failed for ${thread.key}: ${e.message}`);
       if (messages <= memory.maxContextMessages * 2 && chars <= memory.maxContextChars * 2) return;
     }
   }
-  trimContext(conv, memory.keepRecentMessages, budget);
+  trimContext(thread, memory.keepRecentMessages, budget);
 }

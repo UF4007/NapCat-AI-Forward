@@ -6,6 +6,7 @@ const MAX_RESULT_CHARS = 8000;
 // config.mcpServers: { <name>: { command, args?, env?, conversationArgument? } }
 // conversationArgument names a tool argument that the bridge always fills with the current conversation id and
 // hides from the model, so a tool like chat history search can never be pointed at another conversation.
+// It is ignored when conversation.mode is "global".
 export async function loadTools(config) {
   const clients = [];
   const entries = [];
@@ -16,7 +17,9 @@ export async function loadTools(config) {
       for (const tool of await client.listTools()) {
         const name = `${server}__${tool.name}`.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
         const parameters = structuredClone(tool.inputSchema || { type: 'object', properties: {} });
-        const forced = spec.conversationArgument;
+        // In global mode all chats share one conversation, so the model picks which chat to search (the MCP
+        // server still limits that to the allowed groups and private chats).
+        const forced = config.conversation.mode === 'global' ? undefined : spec.conversationArgument;
         if (forced) {
           delete parameters.properties?.[forced];
           if (Array.isArray(parameters.required)) parameters.required = parameters.required.filter((p) => p !== forced);

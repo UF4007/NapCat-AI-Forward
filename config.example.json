@@ -42,6 +42,9 @@
   "history": {
     "maxScanMessages": 1000
   },
+  "conversation": {
+    "mode": "separate"
+  },
   "timezone": "Asia/Shanghai",
   "dataDir": "data",
   "mcpServers": {
