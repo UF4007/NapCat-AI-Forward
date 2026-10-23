@@ -29,4 +29,8 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
       LLM_MODEL: ${LLM_MODEL:?set LLM_MODEL in .env}
       SYSTEM_PROMPT: ${SYSTEM_PROMPT:-}
+      HISTORY_MESSAGES: ${HISTORY_MESSAGES:-}
       ALLOW_GROUPS: ${ALLOW_GROUPS:-}
+      VISION: ${VISION:-false}
+      VISION_STICKERS: ${VISION_STICKERS:-false}
+      IMAGE_MAX_MB: ${IMAGE_MAX_MB:-}

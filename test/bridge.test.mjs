@@ -10,7 +10,8 @@ import { WebSocketServer } from 'ws';
 const BRIDGE = fileURLToPath(new URL('../bridge.mjs', import.meta.url));
 const SELF_ID = 10000;
 
-function message(type, text, { at = false, id, groupId } = {}) {
+// extra: additional segments appended after the text, e.g. images or a reply.
+function message(type, text, { at = false, id, groupId, extra = [] } = {}) {
   return {
     post_type: 'message',
     message_type: type,
@@ -19,16 +20,30 @@ function message(type, text, { at = false, id, groupId } = {}) {
     user_id: 42,
     ...(groupId ? { group_id: groupId } : {}),
     sender: { nickname: 'Alice', card: '' },
-    message: [...(at ? [{ type: 'at', data: { qq: String(SELF_ID) } }] : []), { type: 'text', data: { text } }],
+    message: [
+      ...(at ? [{ type: 'at', data: { qq: String(SELF_ID) } }] : []),
+      ...(text ? [{ type: 'text', data: { text } }] : []),
+      ...extra,
+    ],
   };
 }
 
-// One HTTP server plays both roles: POST /v1/chat/completions is the LLM, WebSocket upgrades are NapCat.
+const image = (url, data = {}) => ({ type: 'image', data: { file: 'x.jpg', url, sub_type: 0, ...data } });
+
+// One HTTP server plays every role: POST /v1/chat/completions is the LLM, GET serves `files` (the QQ image CDN),
+// and WebSocket upgrades are NapCat.
 // onLlm(body, callNumber) returns { status?, json? , text? }; onConnection(ws, connectionNumber) drives NapCat's side.
-async function startMocks({ onLlm, onConnection }) {
+async function startMocks({ onLlm, onConnection, files = {} }) {
   const llmCalls = [];
   const connections = [];
+  const fileHits = [];
   const server = createServer(async (req, res) => {
+    if (req.method === 'GET') {
+      fileHits.push(req.url);
+      const file = files[req.url];
+      res.writeHead(file ? 200 : 404, { 'Content-Type': file?.type || 'text/plain' });
+      return res.end(file?.body || 'not found');
+    }
     let body = '';
     for await (const chunk of req) body += chunk;
     const parsed = JSON.parse(body);
@@ -49,7 +64,7 @@ async function startMocks({ onLlm, onConnection }) {
     wss.close();
     server.close();
   };
-  return { port: server.address().port, llmCalls, connections, close };
+  return { port: server.address().port, llmCalls, connections, fileHits, close };
 }
 
 function startBridge(port, env = {}) {
@@ -92,7 +107,8 @@ test('answers private messages and group @-mentions, honours the allow-list and 
       ws.send(JSON.stringify({ post_type: 'meta_event', meta_event_type: 'heartbeat' }));
       ws.send(JSON.stringify(message('group', '没有 @ 我，不该回', { id: 1, groupId: 777 })));
       ws.send(JSON.stringify(message('group', ' 你好', { at: true, id: 2, groupId: 777 })));
-      ws.send(JSON.stringify(message('private', '私聊问题', { id: 3 })));
+      // VISION is off in this test, so the image must be ignored and never downloaded
+      ws.send(JSON.stringify(message('private', '私聊问题', { id: 3, extra: [image(`http://127.0.0.1:${mocks.port}/never.jpg`)] })));
       ws.send(JSON.stringify(message('group', ' 不在白名单的群', { at: true, id: 4, groupId: 888 })));
     },
   });
@@ -127,6 +143,72 @@ test('answers private messages and group @-mentions, honours the allow-list and 
 
   const firstPrivate = mocks.llmCalls.find((b) => b.messages.at(-1).content === '私聊问题');
   assert.equal(firstPrivate.messages.length, 2, 'group and private contexts are separate');
+  assert.deepEqual(mocks.fileHits, [], 'images are not downloaded when VISION is off');
+});
+
+test('with VISION on, sends images (including the replied-to message) as data URLs and remembers only placeholders', async (t) => {
+  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+  const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 4, 5, 6]);
+  const actions = [];
+  const getMsgCalls = [];
+  let napcat;
+  const mocks = await startMocks({
+    files: {
+      '/cat.png': { type: 'application/octet-stream', body: PNG }, // no usable content type: must be sniffed
+      '/dog.jpg': { type: 'image/jpeg', body: JPEG },
+      '/sticker.png': { type: 'image/png', body: PNG },
+      '/big.png': { type: 'image/png', body: Buffer.alloc(4096) },
+    },
+    onLlm: () => ({ json: { choices: [{ message: { content: '看到了' } }] } }),
+    onConnection: (ws) => {
+      napcat = ws;
+      const url = (path) => `http://127.0.0.1:${mocks.port}${path}`;
+      ws.on('message', (data) => {
+        const req = JSON.parse(data);
+        if (req.action !== 'get_msg') return actions.push(req);
+        getMsgCalls.push(req.params);
+        const original = [{ type: 'text', data: { text: '原消息' } }, image(url('/dog.jpg'))];
+        ws.send(JSON.stringify({ status: 'ok', retcode: 0, data: { message_id: 99, message: original }, echo: req.echo }));
+      });
+      // a normal picture plus a sticker (sub_type 1) that must be skipped
+      ws.send(JSON.stringify(message('group', ' 这是什么', {
+        at: true, id: 1, groupId: 777, extra: [image(url('/cat.png')), image(url('/sticker.png'), { sub_type: 1 })],
+      })));
+    },
+  });
+  const bridge = startBridge(mocks.port, { VISION: 'true', IMAGE_MAX_MB: String(2048 / 1024 / 1024) });
+  t.after(() => {
+    bridge.kill();
+    mocks.close();
+  });
+
+  await waitUntil(() => actions.length === 1);
+  // reply to a message that holds a picture
+  napcat.send(JSON.stringify(message('group', ' 那这张呢', {
+    at: true, id: 2, groupId: 777, extra: [{ type: 'reply', data: { id: '99' } }],
+  })));
+  await waitUntil(() => actions.length === 2);
+  // a private picture over the size limit: answered directly, the model is not called
+  napcat.send(JSON.stringify(message('private', '', { id: 3, extra: [image(`http://127.0.0.1:${mocks.port}/big.png`)] })));
+  await waitUntil(() => actions.length === 3);
+
+  const [first, second] = mocks.llmCalls;
+  assert.deepEqual(first.messages.at(-1).content, [
+    { type: 'text', text: 'Alice：这是什么' },
+    { type: 'image_url', image_url: { url: `data:image/png;base64,${PNG.toString('base64')}` } },
+  ]);
+  assert.ok(!mocks.fileHits.includes('/sticker.png'), 'stickers are skipped');
+
+  assert.deepEqual(getMsgCalls, [{ message_id: '99' }]);
+  assert.deepEqual(second.messages.at(-1).content, [
+    { type: 'text', text: 'Alice：（引用：原消息）那这张呢' },
+    { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${JPEG.toString('base64')}` } },
+  ]);
+  // the earlier turn is remembered as text with a placeholder, not as image data
+  assert.deepEqual(second.messages[1], { role: 'user', content: 'Alice：这是什么 [图片×1]' });
+
+  assert.equal(mocks.llmCalls.length, 2, 'the oversized image never reached the model');
+  assert.equal(replyText(actions[2]), '图片加载失败，请稍后再试。');
 });
 
 test('reports LLM errors without keeping the failed question, and reconnects after a drop', async (t) => {
