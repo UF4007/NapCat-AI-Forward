@@ -8,7 +8,8 @@
     "apiKey": "sk-xxx",
     "model": "gpt-4o-mini",
     "timeoutSeconds": 120,
-    "maxToolRounds": 5
+    "maxToolRounds": 5,
+    "maxConcurrentRequests": 4
   },
   "bot": {
     "name": "小助手",
@@ -32,8 +33,11 @@
   },
   "memory": {
     "maxContextMessages": 40,
+    "maxContextChars": 12000,
     "keepRecentMessages": 10,
-    "maxMemoryChars": 2000
+    "maxMemoryChars": 2000,
+    "maxBatchMessages": 30,
+    "maxMessageChars": 1000
   },
   "timezone": "Asia/Shanghai",
   "dataDir": "data",

@@ -1,11 +1,21 @@
 // Decides what happens to each incoming message: log it, batch it, ask the model, and reply (or stay silent).
-import { compressIfNeeded, contextLine, Conversation } from './conversation.mjs';
-import { complete } from './llm.mjs';
+import { clipTail, compressIfNeeded, contextLine, Conversation, trimContext } from './conversation.mjs';
+import { Llm } from './llm.mjs';
 import { downloadImage, imageUrls, isMentioned, plainText, render, replyId } from './message.mjs';
 import { formatTime } from './store.mjs';
 
 export const NO_REPLY = '[NO_REPLY]';
 const RESET_COMMANDS = new Set(['/reset', '/重置']);
+// Statuses with which providers reject a request itself, most often because it is longer than the model accepts.
+const REJECTED = new Set([400, 413, 422]);
+
+// The newest `max` messages, always including the latest @-mention.
+function limitBatch(messages, mention, max) {
+  if (messages.length <= max) return messages;
+  const kept = messages.slice(-max);
+  if (mention && !kept.includes(mention)) kept.splice(0, 1, mention); // the mention is older than all kept ones
+  return kept;
+}
 
 export class Bot {
   constructor(config, { store, tools, onebot }) {
@@ -13,6 +23,7 @@ export class Bot {
     this.store = store;
     this.tools = tools;
     this.onebot = onebot;
+    this.llm = new Llm(config.llm);
     this.conversations = new Map();
     this.groupAllow = new Set(config.group.allow);
     this.privateAllow = new Set(config.private.allow);
@@ -40,7 +51,7 @@ export class Bot {
     const targetId = isGroup ? ev.group_id : ev.user_id;
     const key = `${isGroup ? 'group' : 'private'}-${targetId}`;
     if (!this.conversations.has(key)) {
-      this.conversations.set(key, new Conversation(key, { isGroup, targetId }, this.store, this.config.memory.keepRecentMessages));
+      this.conversations.set(key, new Conversation(key, { isGroup, targetId }, this.store, this.config.memory));
     }
     return this.conversations.get(key);
   }
@@ -104,39 +115,65 @@ export class Bot {
   }
 
   async flush(conv) {
-    const batch = conv.pending.splice(0);
+    const pending = conv.pending.splice(0);
     conv.firstPendingAt = 0;
-    if (!batch.length) return;
-    const text = batch.map((m) => contextLine(conv.isGroup, m)).join('\n');
-    conv.context.push({ role: 'user', content: text });
+    if (!pending.length) return;
+    const { memory, group } = this.config;
 
-    const mention = batch.findLast((m) => m.mentioned);
+    // A burst (e.g. while the previous request was running) is cut to the newest messages; the rest stay in the log.
+    const mention = pending.findLast((m) => m.mentioned);
+    const batch = limitBatch(pending, mention, memory.maxBatchMessages);
+    const lines = batch.map((m) => contextLine(conv.isGroup, m, memory.maxMessageChars));
+    const omitted = pending.length - batch.length;
+    if (omitted) {
+      lines.unshift(`（期间还有 ${omitted} 条较早的消息已省略${this.tools.definitions.length ? '，需要时可以搜索聊天记录' : ''}）`);
+    }
+    conv.context.push({ role: 'user', content: clipTail(lines.join('\n'), memory.maxContextChars / 2) });
+
     const mustReply = !conv.isGroup || Boolean(mention);
-    if (!mustReply && this.config.group.reply === 'mention') return this.compress(conv); // just listen
+    if (!mustReply && group.reply === 'mention') return this.compress(conv); // just listen
 
+    const images = await this.loadImages(batch);
     let reply;
+    let error;
     try {
-      const content = await this.withImages(batch, text);
-      reply = await complete(this.config.llm, this.messages(conv, content), {
-        tools: this.tools.definitions,
-        onToolCall: (name, args) => this.tools.call(name, args, { conversation: conv.key }),
-      });
+      reply = await this.ask(conv, images);
     } catch (e) {
-      console.error(`LLM request failed for ${conv.key}: ${e.message}`);
-      if (!conv.isGroup) conv.context.pop(); // so the user can simply ask again
-      if (mustReply) this.reply(conv, `出错了：${e.message}`, batch.at(-1).id, { remember: false });
-      return;
+      error = e;
+    }
+    // A rejected request is most likely longer than the model accepts (which may be less than maxContextChars
+    // allows). Rather than failing on every later message, retry with a shorter context, and then with only
+    // this batch, cut to a single message's length.
+    const fallbacks = [[memory.keepRecentMessages, memory.maxContextChars / 4], [1, memory.maxMessageChars]];
+    for (const [keep, budget] of fallbacks) {
+      if (!REJECTED.has(error?.status)) break;
+      console.error(`${conv.key}: request rejected (${error.message}), retrying with a shorter context`);
+      trimContext(conv, keep, budget);
+      error = undefined;
+      try {
+        reply = await this.ask(conv, images);
+      } catch (e) {
+        error = e;
+      }
     }
 
-    if (conv.isGroup && (!reply || reply.includes(NO_REPLY))) return this.compress(conv); // the model chose silence
-    this.reply(conv, reply || '（空回复）', conv.isGroup ? mention?.id : batch.at(-1).id);
+    const quote = conv.isGroup ? mention?.id : batch.at(-1).id;
+    if (error) {
+      console.error(`LLM request failed for ${conv.key}: ${error.message}`);
+      if (!conv.isGroup) conv.context.pop(); // so the user can simply ask again
+      if (mustReply) this.reply(conv, `出错了：${error.message}`, quote, { remember: false });
+    } else if (conv.isGroup && (!reply || reply.includes(NO_REPLY))) {
+      // the model chose silence
+    } else {
+      this.reply(conv, reply || '（空回复）', quote);
+    }
     await this.compress(conv);
   }
 
-  // The batch text, plus its images (downloaded and inlined) when vision is enabled.
-  async withImages(batch, text) {
+  // The batch's images, downloaded for inlining when vision is enabled.
+  async loadImages(batch) {
     const { vision } = this.config;
-    if (!vision.enabled) return text;
+    if (!vision.enabled) return { dataUrls: [], note: '' };
     const urls = batch.flatMap((m) => m.images).slice(-vision.maxImages);
     const results = await Promise.allSettled(urls.map((url) => downloadImage(url, vision.maxImageMB * 1024 * 1024)));
     const dataUrls = [];
@@ -145,9 +182,19 @@ export class Bot {
       else console.error(`image download failed: ${r.reason.message}`);
     }
     const failed = results.length - dataUrls.length;
-    const note = failed ? `\n（有 ${failed} 张图片加载失败）` : '';
-    if (!dataUrls.length) return text + note;
-    return [{ type: 'text', text: text + note }, ...dataUrls.map((url) => ({ type: 'image_url', image_url: { url } }))];
+    return { dataUrls, note: failed ? `\n（有 ${failed} 张图片加载失败）` : '' };
+  }
+
+  // Asks the model about the newest context entry, with this turn's images attached.
+  ask(conv, { dataUrls, note }) {
+    const text = conv.context.at(-1).content + note;
+    const content = dataUrls.length
+      ? [{ type: 'text', text }, ...dataUrls.map((url) => ({ type: 'image_url', image_url: { url } }))]
+      : text;
+    return this.llm.complete(this.messages(conv, content), {
+      tools: this.tools.definitions,
+      onToolCall: (name, args) => this.tools.call(name, args, { conversation: conv.key }),
+    });
   }
 
   // The context holds text only; this turn's entry is swapped for the version carrying images.
@@ -185,6 +232,6 @@ export class Bot {
   }
 
   compress(conv) {
-    return compressIfNeeded(conv, { llm: this.config.llm, memory: this.config.memory, store: this.store });
+    return compressIfNeeded(conv, { llm: this.llm, memory: this.config.memory, store: this.store });
   }
 }

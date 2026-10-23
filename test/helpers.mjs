@@ -31,10 +31,11 @@ export function lastUserText(body) {
   return typeof content === 'string' ? content : content.find((p) => p.type === 'text')?.text ?? '';
 }
 
-// llm(body, callNumber) -> response; files: { path: { type, body } }.
+// llm(body, callNumber) -> response (or a promise of one); files: { path: { type, body } }.
 // state.getMsg ({ message_id: data }) answers get_msg and may be filled in after start.
+// state.maxInFlight records the most LLM requests that were open at the same time.
 export async function startMocks({ llm = () => chat('好的'), files = {} } = {}) {
-  const state = { llmCalls: [], actions: [], connections: [], fileHits: [], sockets: [], getMsg: {} };
+  const state = { llmCalls: [], llmSizes: [], actions: [], connections: [], fileHits: [], sockets: [], getMsg: {}, inFlight: 0, maxInFlight: 0 };
   const server = createServer(async (req, res) => {
     if (req.method === 'GET') {
       state.fileHits.push(req.url);
@@ -42,11 +43,14 @@ export async function startMocks({ llm = () => chat('好的'), files = {} } = {}
       res.writeHead(file ? 200 : 404, { 'Content-Type': file?.type || 'text/plain' });
       return res.end(file?.body || 'not found');
     }
+    state.maxInFlight = Math.max(state.maxInFlight, ++state.inFlight);
     let body = '';
     for await (const chunk of req) body += chunk;
     const parsed = JSON.parse(body);
     state.llmCalls.push(parsed);
-    const { status = 200, json, text } = llm(parsed, state.llmCalls.length);
+    state.llmSizes.push(body.length);
+    const { status = 200, json, text } = await llm(parsed, state.llmCalls.length, body.length);
+    state.inFlight--;
     res.writeHead(status, { 'Content-Type': json ? 'application/json' : 'text/plain' });
     res.end(json ? JSON.stringify(json) : text);
   });
