@@ -27,11 +27,22 @@ export class OneBot {
       if (msg.echo != null && this.pending.has(msg.echo)) this.pending.get(msg.echo)(msg);
       else if (msg.post_type) this.onEvent(msg);
     });
-    ws.addEventListener('error', () => {}); // a close event always follows
-    ws.addEventListener('close', () => {
-      this.log('disconnected, retrying in 5s');
+    // A connection that never opens fires only 'error' in Node's WebSocket (no 'close', and readyState stays
+    // CONNECTING), so both events schedule the retry, once per socket.
+    let retrying = false;
+    const retry = (why) => {
+      if (retrying) return;
+      retrying = true;
+      this.log(`${why}, retrying in 5s`);
+      try {
+        ws.close();
+      } catch {
+        // already closed or never opened
+      }
       setTimeout(() => this.connect(), 5000);
-    });
+    };
+    ws.addEventListener('error', () => retry(ws.readyState === WebSocket.OPEN ? 'connection error' : `cannot connect to ${this.url}`));
+    ws.addEventListener('close', () => retry('disconnected'));
   }
 
   // Connects if needed and resolves once the connection is open.

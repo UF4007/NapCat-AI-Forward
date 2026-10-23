@@ -114,15 +114,25 @@ sudo docker compose up -d
 
 ### 5. 登录 QQ
 
-1. 查看 NapCat 的日志，找到 WebUI 的 token：
+**最简单的方法：直接扫日志里的二维码。**
+
+```bash
+sudo docker compose logs -f napcat
+```
+
+日志里出现"请扫描下面的二维码"后，下方会用字符画出一个二维码，用手机 QQ 登录**小号**扫码即可（按 `Ctrl+C` 退出日志）。终端里的二维码扫不出来时，把日志里"二维码解码URL"后面的链接复制到任意在线二维码生成网站，生成后再扫。
+
+**也可以用 WebUI 登录：**
+
+1. 找到 WebUI 的 token：
    ```bash
-   sudo docker compose logs napcat
+   sudo docker compose logs napcat | grep -i 'WebUi Token'
    ```
-2. WebUI 只对服务器本机开放。在**你自己的电脑**上打开终端，建立一条 SSH 隧道，并保持这个窗口开着：
+2. WebUI 只对服务器本机开放。在**你自己的电脑**上（不是服务器上）打开终端，建立一条 SSH 隧道，并保持这个窗口开着。登录服务器用的端口和密钥照常加上，例如 `-p 端口`、`-i 私钥路径`：
    ```bash
    ssh -L 6099:127.0.0.1:6099 用户名@服务器IP
    ```
-3. 在你电脑的浏览器里打开 `http://127.0.0.1:6099/webui`，输入 token，然后用手机 QQ 登录**小号**扫码。
+3. 在你电脑的浏览器里打开 `http://127.0.0.1:6099/webui`，输入 token，然后用手机 QQ 扫码登录。
 
 ### 6. 确认能用
 
@@ -131,7 +141,7 @@ sudo docker compose logs -f bridge
 ```
 
 - 看到 `connected to ws://napcat:3001` 说明接入层已经连上 NapCat。
-- QQ 登录之前，日志里会反复出现 `disconnected, retrying in 5s`，这是正常的，登录后会自动连上。
+- QQ 登录之前，日志里会每 5 秒出现一次 `cannot connect to ws://napcat:3001, retrying in 5s`，这是正常的，登录后会自动连上。
 - 用另一个 QQ 号私聊机器人，或者在生效的群里 @ 它，看它是否回复。
 
 ### 日常操作

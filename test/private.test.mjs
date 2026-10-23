@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { chat, image, lastUserText, listFiles, message, quotedId, replyText, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
+import { chat, freePort, image, lastUserText, listFiles, message, quotedId, replyText, sleep, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
 
 test('private chat: replies with context, /reset clears it, and no chat history is written to disk', async (t) => {
   const mocks = await startMocks({ llm: (body) => chat(`<think>推理</think>回答:${lastUserText(body)}`) });
@@ -57,4 +57,18 @@ test('private chat: reports LLM errors without keeping the failed question, and 
   await waitUntil(() => mocks.actions.length === 2);
   assert.equal(replyText(mocks.actions[1]), '好的');
   assert.deepEqual(mocks.llmCalls[1].messages.slice(1), [{ role: 'user', content: '第二问' }]);
+});
+
+test('connects once NapCat comes up, even when the bridge started first (e.g. QQ not logged in yet)', async (t) => {
+  const port = await freePort();
+  const config = writeConfig({ port });
+  await startBridge(t, null, config, { wait: false });
+  await sleep(1000); // the first attempt fails: nothing is listening yet
+
+  const mocks = await startMocks({ port, llm: () => chat('连上了') });
+  t.after(mocks.close);
+  await waitUntil(() => mocks.connections.length === 1, 15_000); // retried within the 5 s interval
+  mocks.send(message('private', '在吗', { id: 1 }));
+  await waitUntil(() => mocks.actions.length === 1);
+  assert.equal(replyText(mocks.actions[0]), '连上了');
 });

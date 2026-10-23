@@ -36,7 +36,8 @@ export function lastUserText(body) {
 // state.maxInFlight records the most LLM requests that were open at the same time.
 // state.history ({ conversation: [OneBot message, oldest first] }) plays QQ's message store: every event sent with
 // state.send and every message the bridge sends is appended, and the two history actions read from it.
-export async function startMocks({ llm = () => chat('好的'), files = {} } = {}) {
+// port: listen on a fixed port (default: any free one).
+export async function startMocks({ llm = () => chat('好的'), files = {}, port = 0 } = {}) {
   const state = {
     llmCalls: [], llmSizes: [], actions: [], connections: [], fileHits: [], sockets: [], getMsg: {}, history: {}, historyCalls: [],
     inFlight: 0, maxInFlight: 0,
@@ -110,7 +111,7 @@ export async function startMocks({ llm = () => chat('好的'), files = {} } = {}
       if (response && request.echo != null) ws.send(JSON.stringify({ ...response, echo: request.echo }));
     });
   });
-  server.listen(0, '127.0.0.1');
+  server.listen(port, '127.0.0.1');
   await once(server, 'listening');
   state.port = server.address().port;
   state.url = (path) => `http://127.0.0.1:${state.port}${path}`;
@@ -146,9 +147,9 @@ export function writeConfig(mocks, overrides = {}, dir = mkdtempSync(join(tmpdir
   return path;
 }
 
-// Starts the bridge, waits for it to connect, and registers cleanup on the test context.
-export async function startBridge(t, mocks, configPath) {
-  const connectionsBefore = mocks.connections.length;
+// Starts the bridge and (unless wait is false) waits for it to connect; registers cleanup on the test context.
+export async function startBridge(t, mocks, configPath, { wait = true } = {}) {
+  const connectionsBefore = mocks?.connections.length ?? 0;
   const child = spawn(process.execPath, [join(ROOT, 'src/index.mjs'), configPath], { stdio: ['ignore', 'ignore', 'inherit'] });
   const exited = once(child, 'exit');
   const stop = async () => {
@@ -156,7 +157,7 @@ export async function startBridge(t, mocks, configPath) {
     await exited;
   };
   t.after(stop);
-  await waitUntil(() => mocks.connections.length > connectionsBefore);
+  if (wait) await waitUntil(() => mocks.connections.length > connectionsBefore);
   return { stop };
 }
 
@@ -202,4 +203,14 @@ export function listFiles(dir) {
   } catch {
     return [];
   }
+}
+
+// A local TCP port that is free right now.
+export async function freePort() {
+  const server = createServer().listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const { port } = server.address();
+  server.close();
+  await once(server, 'close');
+  return port;
 }
