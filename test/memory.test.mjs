@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { chat, lastUserText, message, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
+import { chat, lastUserText, listFiles, message, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
 
 const isCompression = (body) => body.messages[0].content.startsWith('你负责整理');
 
@@ -42,11 +42,14 @@ test('memory: a long context is compressed into the memory file, and both surviv
   assert.match(fourth[0].content, /长期记忆[\s\S]*- 对方喜欢猫/);
   assert.deepEqual(fourth.slice(1).map((m) => m.content), ['再见', '回答:再见', '还记得吗']);
 
-  // after a restart, memory comes from the file and recent context from the log tail
+  // after a restart, memory comes from the file and recent context from QQ's history (via NapCat)
   await bridge.stop();
+  const historyCallsBefore = mocks.historyCalls.length;
   await startBridge(t, mocks, config);
   await ask('重启了', 5);
+  assert.equal(mocks.historyCalls.length, historyCallsBefore + 1);
   const fifth = chats()[4].messages;
   assert.match(fifth[0].content, /- 对方喜欢猫/);
   assert.deepEqual(fifth.slice(1).map((m) => m.content), ['还记得吗', '回答:还记得吗', '重启了']);
+  assert.deepEqual(listFiles(join(dirname(config), 'data')), ['memory/private-42.md'], 'only the memory file is written');
 });

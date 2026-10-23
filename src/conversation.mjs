@@ -2,8 +2,7 @@
 // Context entries are { role, content } with string content; their total size is kept within the memory limits.
 
 export class Conversation {
-  // memory: the memory section of config.json
-  constructor(key, { isGroup, targetId }, store, memory) {
+  constructor(key, { isGroup, targetId }, memoryStore) {
     this.key = key;
     this.isGroup = isGroup;
     this.targetId = targetId; // group_id or user_id
@@ -12,10 +11,8 @@ export class Conversation {
     this.timer = null;
     this.intake = Promise.resolve(); // keeps incoming messages in arrival order
     this.tail = Promise.resolve(); // serialises flushes, so replies keep their order
-    this.memory = store.readMemory(key);
-    // after a restart, pick up where the log left off
-    this.context = rebuildContext(store.readLog(key).slice(-memory.keepRecentMessages), isGroup, memory.maxMessageChars);
-    trimContext(this, memory.keepRecentMessages, memory.maxContextChars / 2);
+    this.memory = memoryStore.read(key);
+    this.context = []; // filled from QQ history when the conversation is first seen (see Bot.restore)
   }
 
   run(fn) {
@@ -32,20 +29,22 @@ export const clipTail = (text, max) => (text.length <= max ? text : `…（前�
 
 export const contextChars = (context) => context.reduce((n, m) => n + m.content.length, 0);
 
-// How one incoming message reads in the context; very long messages are cut (the log keeps them whole).
+// How one incoming message reads in the context; very long messages are cut (QQ keeps them whole).
 export const contextLine = (isGroup, { name, userId, text }, maxChars) => {
   const body = clipHead(text, maxChars);
   return isGroup ? `${name}(${userId})：${body}` : body;
 };
 
-function rebuildContext(records, isGroup, maxMessageChars) {
+// Context from history records ({ self, name, userId, text }, oldest first): the bot's own messages become
+// assistant turns, consecutive messages from others are joined into one user turn.
+export function rebuildContext(records, isGroup, maxMessageChars) {
   const context = [];
   for (const r of records) {
     if (r.self) {
       context.push({ role: 'assistant', content: r.text });
       continue;
     }
-    const line = contextLine(isGroup, { name: r.name, userId: r.user_id, text: r.text }, maxMessageChars);
+    const line = contextLine(isGroup, r, maxMessageChars);
     const last = context.at(-1);
     if (last?.role === 'user') last.content += `\n${line}`;
     else context.push({ role: 'user', content: line });
@@ -80,7 +79,7 @@ const compressPrompt = (maxChars) =>
 // everything but the newest entries (at most keepRecentMessages, within half the character budget) into the
 // memory file. If the model is unavailable this is retried next time, unless the context is twice over the
 // limits, in which case the oldest entries are dropped without a summary (they remain in the chat log).
-export async function compressIfNeeded(conv, { llm, memory, store }) {
+export async function compressIfNeeded(conv, { llm, memory, memoryStore }) {
   const messages = conv.context.length;
   const chars = contextChars(conv.context);
   if (messages <= memory.maxContextMessages && chars <= memory.maxContextChars) return;
@@ -98,7 +97,7 @@ export async function compressIfNeeded(conv, { llm, memory, store }) {
       ]);
       if (!summary) throw new Error('the model returned an empty summary');
       conv.memory = summary;
-      store.writeMemory(conv.key, summary);
+      memoryStore.write(conv.key, summary);
     } catch (e) {
       console.error(`memory compression failed for ${conv.key}: ${e.message}`);
       if (messages <= memory.maxContextMessages * 2 && chars <= memory.maxContextChars * 2) return;

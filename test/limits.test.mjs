@@ -1,8 +1,7 @@
 // Keeping requests bounded: bursts, size-based compression, recovery from rejected requests, concurrency.
 import assert from 'node:assert/strict';
-import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { chat, lastUserText, message, quotedId, readJsonl, replyText, sleep, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
+import { chat, lastUserText, message, quotedId, replyText, sleep, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
 
 const isCompression = (body) => body.messages[0].content.startsWith('你负责整理');
 
@@ -84,7 +83,7 @@ test('a request the model rejects is retried with a shorter context, so the conv
   assert.equal(mocks.llmCalls.length - beforeNext, 1, 'the next message goes through at once');
 });
 
-test('long messages and long batches are cut in the context, while the log keeps them whole', async (t) => {
+test('long messages and long batches are cut in the context', async (t) => {
   const mocks = await startMocks({ llm: () => chat('好') });
   t.after(mocks.close);
   const config = writeConfig(mocks, { group: { reply: 'mention' }, memory: { maxMessageChars: 50, maxContextChars: 400 } });
@@ -93,7 +92,6 @@ test('long messages and long batches are cut in the context, while the log keeps
   mocks.send(message('private', 'x'.repeat(200), { id: 1 }));
   await waitUntil(() => mocks.actions.length === 1);
   assert.equal(lastUserText(mocks.llmCalls[0]), `${'x'.repeat(50)}…（过长已截断）`);
-  assert.equal(readJsonl(join(dirname(config), 'data/logs/private-42.jsonl'))[0].text.length, 200);
 
   // ten 50-character group lines plus a mention, all in one batch: cut to the newest 200 characters
   for (let i = 0; i < 10; i++) mocks.send(message('group', `${i}`.repeat(50), { id: 10 + i, groupId: 777 }));

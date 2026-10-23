@@ -2,10 +2,10 @@
 // all on one local HTTP server, plus helpers to run the bridge against them with a temporary config.
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
@@ -34,8 +34,54 @@ export function lastUserText(body) {
 // llm(body, callNumber) -> response (or a promise of one); files: { path: { type, body } }.
 // state.getMsg ({ message_id: data }) answers get_msg and may be filled in after start.
 // state.maxInFlight records the most LLM requests that were open at the same time.
+// state.history ({ conversation: [OneBot message, oldest first] }) plays QQ's message store: every event sent with
+// state.send and every message the bridge sends is appended, and the two history actions read from it.
 export async function startMocks({ llm = () => chat('好的'), files = {} } = {}) {
-  const state = { llmCalls: [], llmSizes: [], actions: [], connections: [], fileHits: [], sockets: [], getMsg: {}, inFlight: 0, maxInFlight: 0 };
+  const state = {
+    llmCalls: [], llmSizes: [], actions: [], connections: [], fileHits: [], sockets: [], getMsg: {}, history: {}, historyCalls: [],
+    inFlight: 0, maxInFlight: 0,
+  };
+  let nextId = 900000;
+  const remember = (conversation, msg) => (state.history[conversation] ||= []).push(msg);
+
+  // NapCat's get_group_msg_history / get_friend_msg_history: the latest `count` messages, or with message_seq
+  // (a message id) the `count` messages up to and including it; an empty result is reported as an error.
+  const history = (conversation, { count, message_seq: anchor }) => {
+    const list = state.history[conversation] || [];
+    const end = anchor == null ? list.length : list.findIndex((m) => String(m.message_id) === String(anchor)) + 1;
+    const page = end > 0 ? list.slice(Math.max(0, end - count), end) : [];
+    return page.length ? { status: 'ok', retcode: 0, data: { messages: page } } : { status: 'failed', retcode: 1400, message: `消息${anchor}不存在` };
+  };
+
+  const answer = (request) => {
+    const p = request.params;
+    switch (request.action) {
+      case 'get_msg': {
+        const found = state.getMsg[p.message_id];
+        return found ? { status: 'ok', retcode: 0, data: found } : { status: 'failed', retcode: 1400, message: 'not found' };
+      }
+      case 'get_group_msg_history':
+        state.historyCalls.push(request);
+        return history(`group-${p.group_id}`, p);
+      case 'get_friend_msg_history':
+        state.historyCalls.push(request);
+        return history(`private-${p.user_id}`, p);
+      case 'send_group_msg':
+      case 'send_private_msg': {
+        state.actions.push(request);
+        const isGroup = request.action === 'send_group_msg';
+        remember(isGroup ? `group-${p.group_id}` : `private-${p.user_id}`, {
+          post_type: 'message', message_type: isGroup ? 'group' : 'private', self_id: SELF_ID, user_id: SELF_ID,
+          message_id: nextId++, time: Math.floor(Date.now() / 1000), sender: { nickname: '机器人' }, message: p.message,
+          ...(isGroup ? { group_id: p.group_id } : {}),
+        });
+        return null; // fire and forget
+      }
+      default:
+        state.actions.push(request);
+        return null;
+    }
+  };
   const server = createServer(async (req, res) => {
     if (req.method === 'GET') {
       state.fileHits.push(req.url);
@@ -60,18 +106,21 @@ export async function startMocks({ llm = () => chat('好的'), files = {} } = {}
     state.sockets.push(ws);
     ws.on('message', (data) => {
       const request = JSON.parse(data);
-      if (request.action !== 'get_msg') return state.actions.push(request);
-      const found = state.getMsg[request.params.message_id];
-      ws.send(JSON.stringify(found
-        ? { status: 'ok', retcode: 0, data: found, echo: request.echo }
-        : { status: 'failed', retcode: 1400, message: 'not found', echo: request.echo }));
+      const response = answer(request);
+      if (response && request.echo != null) ws.send(JSON.stringify({ ...response, echo: request.echo }));
     });
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   state.port = server.address().port;
   state.url = (path) => `http://127.0.0.1:${state.port}${path}`;
-  state.send = (event) => state.sockets.at(-1).send(JSON.stringify(event));
+  // like NapCat, events go to every connected client (the bridge, and the chat-history MCP server once it connects)
+  state.send = (event) => {
+    if (event.post_type === 'message') {
+      remember(event.message_type === 'group' ? `group-${event.group_id}` : `private-${event.user_id}`, event);
+    }
+    for (const ws of wss.clients) ws.send(JSON.stringify(event));
+  };
   state.close = () => {
     for (const ws of wss.clients) ws.terminate();
     wss.close();
@@ -122,12 +171,13 @@ export async function waitUntil(predicate, ms = 10_000) {
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // extra: additional segments appended after the text, e.g. images or a reply.
-export function message(type, text, { at = false, id, groupId, userId = 42, name = 'Alice', extra = [] } = {}) {
+export function message(type, text, { at = false, id, groupId, userId = 42, name = 'Alice', extra = [], time = Math.floor(Date.now() / 1000) } = {}) {
   return {
     post_type: 'message',
     message_type: type,
     self_id: SELF_ID,
     message_id: id,
+    time,
     user_id: userId,
     ...(groupId ? { group_id: groupId } : {}),
     sender: { nickname: name, card: '' },
@@ -144,9 +194,11 @@ export const image = (url, data = {}) => ({ type: 'image', data: { file: 'x.jpg'
 export const replyText = (action) => action.params.message.find((s) => s.type === 'text').data.text;
 export const quotedId = (action) => action.params.message.find((s) => s.type === 'reply')?.data.id;
 
-export function readJsonl(path) {
+// Every file under dir, as paths relative to it (the bridge may only ever write memory files).
+export function listFiles(dir) {
   try {
-    return readFileSync(path, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    return readdirSync(dir, { recursive: true, withFileTypes: true }).filter((e) => e.isFile())
+      .map((e) => relative(dir, join(e.parentPath, e.name))).sort();
   } catch {
     return [];
   }

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { chat, image, lastUserText, message, quotedId, readJsonl, replyText, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
+import { chat, image, lastUserText, listFiles, message, quotedId, replyText, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
 
-test('private chat: replies with context, /reset clears it, everything is logged', async (t) => {
+test('private chat: replies with context, /reset clears it, and no chat history is written to disk', async (t) => {
   const mocks = await startMocks({ llm: (body) => chat(`<think>推理</think>回答:${lastUserText(body)}`) });
   t.after(mocks.close);
   const config = writeConfig(mocks, { onebot: { token: 'secret' } });
@@ -37,13 +37,9 @@ test('private chat: replies with context, /reset clears it, everything is logged
   assert.equal(mocks.llmCalls.length, 3, '/reset does not call the model');
   assert.deepEqual(mocks.llmCalls[2].messages.map((m) => m.role), ['system', 'user']);
 
-  const log = readJsonl(join(dirname(config), 'data/logs/private-42.jsonl'));
-  assert.deepEqual(log.map((r) => [r.self ? 'bot' : r.user_id, r.text]), [
-    [42, '你好[图片]'], ['bot', '回答:你好[图片]'],
-    [42, '再问'], ['bot', '回答:再问'],
-    [42, '/reset'], ['bot', '上下文已清空。'],
-    [42, '新问题'], ['bot', '回答:新问题'],
-  ]);
+  // the first message looked for earlier history in QQ (there was none besides itself)
+  assert.deepEqual(mocks.historyCalls.map((r) => [r.action, r.params.user_id]), [['get_friend_msg_history', '42']]);
+  assert.deepEqual(listFiles(join(dirname(config), 'data')), [], 'chat history stays in QQ');
 });
 
 test('private chat: reports LLM errors without keeping the failed question, and reconnects after a drop', async (t) => {

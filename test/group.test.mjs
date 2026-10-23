@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { chat, lastUserText, message, quotedId, readJsonl, replyText, sleep, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
+import { chat, lastUserText, listFiles, message, quotedId, replyText, sleep, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
 
 const group = (text, id, opts = {}) => message('group', text, { id, groupId: 777, ...opts });
 
@@ -59,9 +58,8 @@ test('auto mode: batches messages, the model decides whether to speak, @ is answ
     { role: 'user', content: 'Alice(42)：@你 在吗' },
   ]);
 
-  const dir = dirname(config);
-  assert.equal(readJsonl(join(dir, 'data/logs/group-777.jsonl')).length, 7, '5 messages + 2 replies');
-  assert.ok(!existsSync(join(dir, 'data/logs/group-888.jsonl')), 'not-allowed groups are not logged');
+  assert.ok(!mocks.historyCalls.some((r) => r.params.group_id === '888'), 'not-allowed groups are never read');
+  assert.deepEqual(listFiles(join(dirname(config), 'data')), [], 'chat history stays in QQ');
 });
 
 test('mention mode: listens to everything but only answers @-mentions', async (t) => {

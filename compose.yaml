@@ -20,6 +20,6 @@ services:
       - ./src:/app/src:ro
       - ./mcp:/app/mcp:ro
       - ./config.json:/app/config.json:ro
-      - ./data/bridge:/app/data # chat logs and memory files
+      - ./data/bridge:/app/data # long-term memory files (chat history stays in QQ)
     extra_hosts:
       - "host.docker.internal:host-gateway" # lets llm.baseUrl reach a model server (e.g. Ollama) on the host

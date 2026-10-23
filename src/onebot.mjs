@@ -1,8 +1,10 @@
 // OneBot 11 forward-WebSocket client: reconnects on its own, delivers events, and calls actions.
 export class OneBot {
-  constructor({ url, token }) {
+  // log: where connection messages go (the MCP server passes console.error, since its stdout is the protocol).
+  constructor({ url, token }, { log = console.log } = {}) {
     this.url = url;
     this.token = token;
+    this.log = log;
     this.ws = null;
     this.pending = new Map(); // echo -> callback for action responses
     this.seq = 0;
@@ -14,7 +16,7 @@ export class OneBot {
     if (this.token) url.searchParams.set('access_token', this.token);
     const ws = new WebSocket(url);
     this.ws = ws;
-    ws.addEventListener('open', () => console.log(`connected to ${this.url}`));
+    ws.addEventListener('open', () => this.log(`connected to ${this.url}`));
     ws.addEventListener('message', ({ data }) => {
       let msg;
       try {
@@ -27,9 +29,19 @@ export class OneBot {
     });
     ws.addEventListener('error', () => {}); // a close event always follows
     ws.addEventListener('close', () => {
-      console.log('disconnected, retrying in 5s');
+      this.log('disconnected, retrying in 5s');
       setTimeout(() => this.connect(), 5000);
     });
+  }
+
+  // Connects if needed and resolves once the connection is open.
+  async ready(timeoutMs = 10_000) {
+    if (!this.ws) this.connect();
+    const deadline = Date.now() + timeoutMs;
+    while (this.ws.readyState !== WebSocket.OPEN) {
+      if (Date.now() > deadline) throw new Error(`cannot connect to NapCat at ${this.url}`);
+      await new Promise((r) => setTimeout(r, 50));
+    }
   }
 
   // Fire and forget; returns false when not connected.

@@ -39,6 +39,9 @@
     "maxBatchMessages": 30,
     "maxMessageChars": 1000
   },
+  "history": {
+    "maxScanMessages": 1000
+  },
   "timezone": "Asia/Shanghai",
   "dataDir": "data",
   "mcpServers": {

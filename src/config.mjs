@@ -16,8 +16,10 @@ const DEFAULTS = {
   memory: {
     maxContextMessages: 40, maxContextChars: 12000, keepRecentMessages: 10, maxMemoryChars: 2000, maxBatchMessages: 30, maxMessageChars: 1000,
   },
+  // Chat history search (mcp/chat-history.mjs) reads at most this many messages back from QQ per search.
+  history: { maxScanMessages: 1000 },
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-  dataDir: 'data',
+  dataDir: 'data', // long-term memory files only; chat history stays in QQ
   mcpServers: {},
 };
 
@@ -51,7 +53,11 @@ export function loadConfig(path) {
     throw new Error(`group.reply must be "auto" or "mention", got ${JSON.stringify(config.group.reply)}`);
   }
   if (!config.llm.model) throw new Error('llm.model is required');
-  const positive = { 'llm.maxConcurrentRequests': config.llm.maxConcurrentRequests, 'memory.maxBatchMessages': config.memory.maxBatchMessages };
+  const positive = {
+    'llm.maxConcurrentRequests': config.llm.maxConcurrentRequests,
+    'memory.maxBatchMessages': config.memory.maxBatchMessages,
+    'history.maxScanMessages': config.history.maxScanMessages,
+  };
   for (const [name, value] of Object.entries(positive)) {
     if (!(Number.isInteger(value) && value >= 1)) throw new Error(`${name} must be a whole number of at least 1`);
   }

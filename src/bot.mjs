@@ -1,8 +1,9 @@
-// Decides what happens to each incoming message: log it, batch it, ask the model, and reply (or stay silent).
-import { clipTail, compressIfNeeded, contextLine, Conversation, trimContext } from './conversation.mjs';
+// Decides what happens to each incoming message: batch it, ask the model, and reply (or stay silent).
+import { clipTail, compressIfNeeded, contextLine, Conversation, rebuildContext, trimContext } from './conversation.mjs';
+import { recentRecords } from './history.mjs';
 import { Llm } from './llm.mjs';
 import { downloadImage, imageUrls, isMentioned, plainText, render, replyId } from './message.mjs';
-import { formatTime } from './store.mjs';
+import { formatTime } from './time.mjs';
 
 export const NO_REPLY = '[NO_REPLY]';
 const RESET_COMMANDS = new Set(['/reset', '/重置']);
@@ -18,16 +19,15 @@ function limitBatch(messages, mention, max) {
 }
 
 export class Bot {
-  constructor(config, { store, tools, onebot }) {
+  constructor(config, { memoryStore, tools, onebot }) {
     this.config = config;
-    this.store = store;
+    this.memoryStore = memoryStore;
     this.tools = tools;
     this.onebot = onebot;
     this.llm = new Llm(config.llm);
     this.conversations = new Map();
     this.groupAllow = new Set(config.group.allow);
     this.privateAllow = new Set(config.private.allow);
-    this.selfId = null;
   }
 
   accepts(ev) {
@@ -41,7 +41,6 @@ export class Bot {
 
   onEvent(ev) {
     if (!this.accepts(ev)) return;
-    this.selfId = ev.self_id;
     const conv = this.conversation(ev);
     conv.intake = conv.intake.then(() => this.receive(conv, ev)).catch((e) => console.error(`${conv.key}: ${e.stack || e}`));
   }
@@ -51,16 +50,29 @@ export class Bot {
     const targetId = isGroup ? ev.group_id : ev.user_id;
     const key = `${isGroup ? 'group' : 'private'}-${targetId}`;
     if (!this.conversations.has(key)) {
-      this.conversations.set(key, new Conversation(key, { isGroup, targetId }, this.store, this.config.memory));
+      const conv = new Conversation(key, { isGroup, targetId }, this.memoryStore);
+      conv.restored = this.restore(conv, ev);
+      this.conversations.set(key, conv);
     }
     return this.conversations.get(key);
   }
 
+  // The first time a conversation is seen (e.g. after a restart), start from its latest messages in QQ.
+  async restore(conv, firstEvent) {
+    const { keepRecentMessages, maxMessageChars, maxContextChars } = this.config.memory;
+    try {
+      const records = await recentRecords(this.onebot, conv.key, keepRecentMessages, firstEvent);
+      conv.context = rebuildContext(records, conv.isGroup, maxMessageChars);
+      trimContext(conv, keepRecentMessages, maxContextChars / 2);
+    } catch (e) {
+      console.error(`${conv.key}: could not load recent history from NapCat: ${e.message}`);
+    }
+  }
+
   async receive(conv, ev) {
+    await conv.restored;
     const msg = await this.describe(ev);
     if (!msg.text) return;
-    const time = ev.time ? new Date(ev.time * 1000).toISOString() : new Date().toISOString();
-    this.store.appendLog(conv.key, { time, message_id: ev.message_id, user_id: ev.user_id, name: msg.name, text: msg.text });
 
     if (RESET_COMMANDS.has(msg.plain) && (!conv.isGroup || msg.mentioned)) {
       return conv.run(() => {
@@ -120,7 +132,7 @@ export class Bot {
     if (!pending.length) return;
     const { memory, group } = this.config;
 
-    // A burst (e.g. while the previous request was running) is cut to the newest messages; the rest stay in the log.
+    // A burst (e.g. while the previous request was running) is cut to the newest messages; the rest stay in QQ.
     const mention = pending.findLast((m) => m.mentioned);
     const batch = limitBatch(pending, mention, memory.maxBatchMessages);
     const lines = batch.map((m) => contextLine(conv.isGroup, m, memory.maxMessageChars));
@@ -227,11 +239,10 @@ export class Bot {
     ];
     const target = conv.isGroup ? { group_id: conv.targetId } : { user_id: conv.targetId };
     this.onebot.send(conv.isGroup ? 'send_group_msg' : 'send_private_msg', { ...target, message });
-    this.store.appendLog(conv.key, { time: new Date().toISOString(), user_id: this.selfId, name: this.config.bot.name || '我', text, self: true });
     if (remember) conv.context.push({ role: 'assistant', content: text });
   }
 
   compress(conv) {
-    return compressIfNeeded(conv, { llm: this.llm, memory: this.config.memory, store: this.store });
+    return compressIfNeeded(conv, { llm: this.llm, memory: this.config.memory, memoryStore: this.memoryStore });
   }
 }
