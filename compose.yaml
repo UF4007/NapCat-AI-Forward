@@ -1,0 +1,32 @@
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    restart: unless-stopped
+    environment:
+      MODE: ws # WebSocket server on 0.0.0.0:3001 inside the compose network only
+      WEBUI_TOKEN: ${WEBUI_TOKEN:?set WEBUI_TOKEN in .env}
+    ports:
+      - "127.0.0.1:6099:6099" # WebUI for QR login; 3001 is deliberately not published
+    volumes:
+      - ./data/qq:/app/.config/QQ
+      - ./data/config:/app/napcat/config
+
+  bridge:
+    image: node:22-alpine
+    restart: unless-stopped
+    depends_on: [napcat]
+    user: node
+    working_dir: /app
+    command: ["node", "bridge.mjs"]
+    volumes:
+      - ./bridge.mjs:/app/bridge.mjs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # lets LLM_BASE_URL reach a model server (e.g. Ollama) on the host
+    environment:
+      ONEBOT_WS: ws://napcat:3001
+      ONEBOT_TOKEN: ${ONEBOT_TOKEN:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:?set LLM_BASE_URL in .env}
+      LLM_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+      LLM_MODEL: ${LLM_MODEL:?set LLM_MODEL in .env}
+      SYSTEM_PROMPT: ${SYSTEM_PROMPT:-}
+      ALLOW_GROUPS: ${ALLOW_GROUPS:-}
