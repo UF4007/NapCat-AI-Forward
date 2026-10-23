@@ -1,5 +1,7 @@
 // Keeping requests bounded: bursts, size-based compression, recovery from rejected requests, concurrency.
 import assert from 'node:assert/strict';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { chat, lastUserText, message, quotedId, replyText, sleep, startBridge, startMocks, waitUntil, writeConfig } from './helpers.mjs';
 
@@ -81,6 +83,25 @@ test('a request the model rejects is retried with a shorter context, so the conv
   const beforeNext = mocks.llmCalls.length;
   await ask(4);
   assert.equal(mocks.llmCalls.length - beforeNext, 1, 'the next message goes through at once');
+});
+
+test('when even the shortest context is rejected, the last retry also leaves out long-term memory', async (t) => {
+  const LIMIT = 2000; // smaller than the memory alone
+  const mocks = await startMocks({
+    llm: (_body, _n, size) => (size > LIMIT ? { status: 400, text: 'context length exceeded' } : chat('ok')),
+  });
+  t.after(mocks.close);
+  const config = writeConfig(mocks, { memory: { maxMemoryChars: 5000 } });
+  mkdirSync(join(dirname(config), 'data/memory'), { recursive: true });
+  writeFileSync(join(dirname(config), 'data/memory/private-42.md'), 'm'.repeat(3000));
+  await startBridge(t, mocks, config);
+
+  mocks.send(message('private', '你好', { id: 1 }));
+  await waitUntil(() => mocks.actions.length === 1);
+  assert.equal(mocks.llmCalls.length, 3, 'rejected, rejected after the first trim, accepted without memory');
+  assert.match(mocks.llmCalls[1].messages[0].content, /长期记忆/);
+  assert.doesNotMatch(mocks.llmCalls[2].messages[0].content, /长期记忆/);
+  assert.equal(replyText(mocks.actions[0]), 'ok', 'the conversation does not get stuck');
 });
 
 test('long messages and long batches are cut in the context', async (t) => {

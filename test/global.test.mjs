@@ -76,7 +76,9 @@ test('global: one memory file for all chats', async (t) => {
     await waitUntil(() => mocks.actions.length === n);
   }
   await waitUntil(() => mocks.llmCalls.some(isCompression));
-  const transcript = mocks.llmCalls.find(isCompression).messages[1].content;
+  const [system, { content: transcript }] = mocks.llmCalls.find(isCompression).messages;
+  assert.match(system.content, /不超过 4000 字/, 'more room by default, as one memory covers every chat');
+  assert.match(system.content, /由多个群和私聊共用/);
   assert.match(transcript, /\[private-42\] Alice\(42\)：第 1 条\n你：\[private-42\] 好\n\[private-43\] Alice\(43\)：第 2 条/);
   await waitUntil(() => listFiles(join(dirname(config), 'data')).length === 1);
   assert.deepEqual(listFiles(join(dirname(config), 'data')), ['memory/global.md']);

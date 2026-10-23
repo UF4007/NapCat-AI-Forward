@@ -13,6 +13,7 @@ const DEFAULTS = {
   group: { reply: 'auto', allow: [], debounceSeconds: 8, maxWaitSeconds: 30 },
   vision: { enabled: false, stickers: false, maxImages: 4, maxImageMB: 10 },
   // Context limits: compression starts past maxContextMessages entries or maxContextChars characters.
+  // maxMemoryChars caps the memory file; in global mode it defaults to 4000, as one memory covers every chat.
   memory: {
     maxContextMessages: 40, maxContextChars: 12000, keepRecentMessages: 10, maxMemoryChars: 2000, maxBatchMessages: 30, maxMessageChars: 1000,
   },
@@ -51,6 +52,7 @@ export function loadConfig(path) {
   config.dataDir = resolve(config.baseDir, config.dataDir);
   config.group.allow = config.group.allow.map(String);
   config.private.allow = config.private.allow.map(String);
+  if (config.conversation.mode === 'global' && raw.memory?.maxMemoryChars === undefined) config.memory.maxMemoryChars = 4000;
 
   if (!['separate', 'global'].includes(config.conversation.mode)) {
     throw new Error(`conversation.mode must be "separate" or "global", got ${JSON.stringify(config.conversation.mode)}`);
@@ -62,6 +64,7 @@ export function loadConfig(path) {
   const positive = {
     'llm.maxConcurrentRequests': config.llm.maxConcurrentRequests,
     'memory.maxBatchMessages': config.memory.maxBatchMessages,
+    'memory.maxMemoryChars': config.memory.maxMemoryChars,
     'history.maxScanMessages': config.history.maxScanMessages,
   };
   for (const [name, value] of Object.entries(positive)) {

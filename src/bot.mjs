@@ -64,7 +64,8 @@ export class Bot {
   thread(chatKey, isGroup) {
     const key = this.global ? 'global' : chatKey;
     if (!this.threads.has(key)) {
-      this.threads.set(key, new Thread(key, this.memoryStore, { labelled: this.global, isPrivate: !this.global && !isGroup }));
+      const { maxMemoryChars } = this.config.memory;
+      this.threads.set(key, new Thread(key, this.memoryStore, { labelled: this.global, isPrivate: !this.global && !isGroup, maxMemoryChars }));
     }
     return this.threads.get(key);
   }
@@ -120,6 +121,7 @@ export class Bot {
     }
     return {
       id: ev.message_id,
+      time: ev.time ? ev.time * 1000 : Date.now(),
       userId: ev.user_id,
       name: ev.sender?.card || ev.sender?.nickname || String(ev.user_id),
       text,
@@ -156,7 +158,7 @@ export class Bot {
     if (omitted) {
       lines.unshift(`（期间还有 ${omitted} 条较早的消息已省略${this.tools.definitions.length ? '，需要时可以搜索聊天记录' : ''}）`);
     }
-    thread.context.push({ role: 'user', content: clipTail(lines.join('\n'), memory.maxContextChars / 2) });
+    thread.context.push({ role: 'user', content: clipTail(lines.join('\n'), memory.maxContextChars / 2), time: batch[0].time });
 
     const mustReply = !chat.isGroup || Boolean(mention);
     if (!mustReply && group.reply === 'mention') return this.compress(thread); // just listen
@@ -171,15 +173,16 @@ export class Bot {
     }
     // A rejected request is most likely longer than the model accepts (which may be less than maxContextChars
     // allows). Rather than failing on every later message, retry with a shorter context, and then with only
-    // this batch, cut to a single message's length.
-    const fallbacks = [[memory.keepRecentMessages, memory.maxContextChars / 4], [1, memory.maxMessageChars]];
-    for (const [keep, budget] of fallbacks) {
+    // this batch, cut to a single message's length, and without long-term memory.
+    const fallbacks = [[memory.keepRecentMessages, memory.maxContextChars / 4, true], [1, memory.maxMessageChars, false]];
+    for (const [keep, budget, withMemory] of fallbacks) {
       if (!REJECTED.has(error?.status)) break;
-      console.error(`${chat.key}: request rejected (${error.message}), retrying with a shorter context`);
+      const shorter = withMemory ? 'a shorter context' : 'only this batch and no long-term memory';
+      console.error(`${chat.key}: request rejected (${error.message}), retrying with ${shorter}`);
       trimContext(thread, keep, budget);
       error = undefined;
       try {
-        reply = await this.ask(chat, images);
+        reply = await this.ask(chat, images, { withMemory });
       } catch (e) {
         error = e;
       }
@@ -215,23 +218,24 @@ export class Bot {
   }
 
   // Asks the model about the newest context entry, with this turn's images attached.
-  ask(chat, { dataUrls, note }) {
+  ask(chat, { dataUrls, note }, { withMemory = true } = {}) {
     const text = chat.thread.context.at(-1).content + note;
     const content = dataUrls.length
       ? [{ type: 'text', text }, ...dataUrls.map((url) => ({ type: 'image_url', image_url: { url } }))]
       : text;
-    return this.llm.complete(this.messages(chat, content), {
+    return this.llm.complete(this.messages(chat, content, withMemory), {
       tools: this.tools.definitions,
       onToolCall: (name, args) => this.tools.call(name, args, { conversation: chat.key }),
     });
   }
 
   // The context holds text only; this turn's entry is swapped for the version carrying images.
-  messages(chat, content) {
-    return [{ role: 'system', content: this.systemPrompt(chat) }, ...chat.thread.context.slice(0, -1), { role: 'user', content }];
+  messages(chat, content, withMemory) {
+    const earlier = chat.thread.context.slice(0, -1).map(({ role, content: text }) => ({ role, content: text }));
+    return [{ role: 'system', content: this.systemPrompt(chat, withMemory) }, ...earlier, { role: 'user', content }];
   }
 
-  systemPrompt(chat) {
+  systemPrompt(chat, withMemory) {
     const { bot, group, timezone } = this.config;
     const lines = [bot.systemPrompt];
     if (bot.name) lines.push(`你的名字是「${bot.name}」。`);
@@ -252,7 +256,7 @@ export class Bot {
     if (this.global) lines.push('发言时直接说你要说的话，不要加"[会话 ID]"标签或"昵称："这样的前缀。');
     else if (chat.isGroup) lines.push('发言时直接说你要说的话，不要加"昵称："这样的前缀。');
     const { memory } = chat.thread;
-    if (memory) {
+    if (memory && withMemory) {
       lines.push(this.global
         ? `以下是你的长期记忆（由所有群和私聊的较早聊天整理而来）：\n${memory}`
         : `以下是你对这个会话的长期记忆（由较早的聊天整理而来）：\n${memory}`);
@@ -267,10 +271,11 @@ export class Bot {
     ];
     const target = chat.isGroup ? { group_id: chat.targetId } : { user_id: chat.targetId };
     this.onebot.send(chat.isGroup ? 'send_group_msg' : 'send_private_msg', { ...target, message });
-    if (remember) chat.thread.context.push({ role: 'assistant', content: assistantLine(chat, text) });
+    if (remember) chat.thread.context.push({ role: 'assistant', content: assistantLine(chat, text), time: Date.now() });
   }
 
   compress(thread) {
-    return compressIfNeeded(thread, { llm: this.llm, memory: this.config.memory, memoryStore: this.memoryStore });
+    const { memory, timezone } = this.config;
+    return compressIfNeeded(thread, { llm: this.llm, memory, memoryStore: this.memoryStore, timezone });
   }
 }

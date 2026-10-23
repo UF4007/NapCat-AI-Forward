@@ -1,4 +1,5 @@
-// Long-term memory: one Markdown file per conversation ("group-<id>" or "private-<id>") in <dataDir>/memory.
+// Long-term memory: one Markdown file per conversation ("group-<id>" or "private-<id>", or "global" in global
+// mode) in <dataDir>/memory.
 // This is the only thing written to disk; chat history itself is read from QQ through NapCat.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
