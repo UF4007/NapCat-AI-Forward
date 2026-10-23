@@ -40,19 +40,117 @@
 
 会话 ID 的格式是 `group-群号` 或 `private-QQ号`。
 
-## 用 Docker Compose 部署（推荐）
+## 从零开始安装（Docker Compose，推荐）
+
+下面以一台全新的 Linux 服务器（Ubuntu 或 Debian）为例。Windows 和 Mac 见本节末尾。
+
+### 准备
+
+- 一台能联网的 Linux 服务器，x86 或 ARM 均可。NapCat 要运行完整的 QQ 客户端，建议至少 2 GB 内存。
+- 一个用来当机器人的 **QQ 小号**，以及手机 QQ（用来扫码登录）。
+- 一个 OpenAI 兼容接口的地址、API Key 和模型名。
+
+### 1. 安装 git 和 Docker
 
 ```bash
-cp config.example.json config.json   # 至少修改 llm.apiKey、llm.model 和 group.allow
-docker compose up -d
-docker compose logs napcat           # 在输出里找到 WebUI 的 token
+sudo apt update && sudo apt install -y git curl
+curl -fsSL https://get.docker.com | sudo sh
+sudo docker compose version     # 能输出版本号就说明装好了
 ```
 
-然后在浏览器打开 `http://127.0.0.1:6099/webui`，输入 token 后扫码登录 QQ。之后可以用 `docker compose logs -f bridge` 查看本项目的日志。
+**服务器在国内时：**
 
-- **一定要先创建 `config.json` 再启动**，否则 Docker 会自动创建一个同名的空目录。
-- NapCat 的登录数据保存在 `data/napcat/`，本项目的聊天记录和记忆保存在 `data/bridge/`。
-- WebUI 只绑定在 `127.0.0.1`。在远程服务器上，可以用 `ssh -L 6099:127.0.0.1:6099 你的服务器` 转发到本地再打开。
+- 官方源可能很慢，安装 Docker 那一步可以换成：
+  ```bash
+  curl -fsSL https://get.docker.com | sudo sh -s -- --mirror Aliyun
+  ```
+- 从 Docker Hub 拉取镜像经常失败，需要配置镜像加速器。云服务商一般都提供（例如阿里云"容器镜像服务"里有专属加速地址）。把它写进 `/etc/docker/daemon.json`，然后执行 `sudo systemctl restart docker`：
+  ```json
+  { "registry-mirrors": ["https://你的加速地址"] }
+  ```
+  网上的公共加速地址变动频繁，这里不列具体地址。
+
+### 2. 下载项目
+
+```bash
+git clone https://github.com/UF4007/NapCat-AI-Forward.git
+cd NapCat-AI-Forward
+```
+
+访问 GitHub 很慢时，也可以在网页上下载 ZIP 包，上传到服务器后解压。
+
+### 3. 填写配置
+
+```bash
+cp config.example.json config.json
+nano config.json
+```
+
+**一定要先创建 `config.json` 再启动**，否则 Docker 会自动创建一个同名的空目录，接入层就无法启动。
+
+至少要修改这几项（完整说明见[配置说明](#配置说明)）：
+
+| 配置项 | 改成什么 |
+|---|---|
+| `llm.baseUrl` | 你的接口地址，例如 `https://api.deepseek.com/v1` |
+| `llm.apiKey` | 你的 API Key |
+| `llm.model` | 模型名，例如 `deepseek-chat` |
+| `group.allow` | 要让机器人生效的群号，例如 `[12345678]`。**模板里的 `123456789` 只是占位符** |
+| `bot.name` | 机器人的名字（可选） |
+
+- 模型**不支持工具调用**时，把 `mcpServers` 改成 `{}`。
+- 识图默认关闭，模型支持看图时再把 `vision.enabled` 改成 `true`。
+
+在 nano 里按 `Ctrl+O` 再按回车保存，按 `Ctrl+X` 退出。
+
+### 4. 启动
+
+```bash
+sudo docker compose up -d
+```
+
+第一次启动要下载 NapCat 和 Node.js 的镜像，需要等一会儿。
+
+### 5. 登录 QQ
+
+1. 查看 NapCat 的日志，找到 WebUI 的 token：
+   ```bash
+   sudo docker compose logs napcat
+   ```
+2. WebUI 只对服务器本机开放。在**你自己的电脑**上打开终端，建立一条 SSH 隧道，并保持这个窗口开着：
+   ```bash
+   ssh -L 6099:127.0.0.1:6099 用户名@服务器IP
+   ```
+3. 在你电脑的浏览器里打开 `http://127.0.0.1:6099/webui`，输入 token，然后用手机 QQ 登录**小号**扫码。
+
+### 6. 确认能用
+
+```bash
+sudo docker compose logs -f bridge
+```
+
+- 看到 `connected to ws://napcat:3001` 说明接入层已经连上 NapCat。
+- QQ 登录之前，日志里会反复出现 `disconnected, retrying in 5s`，这是正常的，登录后会自动连上。
+- 用另一个 QQ 号私聊机器人，或者在生效的群里 @ 它，看它是否回复。
+
+### 日常操作
+
+| 要做的事 | 命令 |
+|---|---|
+| 修改 `config.json` 后生效 | `sudo docker compose restart bridge` |
+| 更新本项目 | `git pull && sudo docker compose restart bridge` |
+| 更新 NapCat | `sudo docker compose pull napcat && sudo docker compose up -d` |
+| 查看日志 | `sudo docker compose logs -f bridge` |
+| 停止 | `sudo docker compose down` |
+
+聊天记录和记忆保存在 `data/bridge/`，QQ 登录数据保存在 `data/napcat/`。迁移或备份时带上整个 `data/` 目录即可。
+
+### Windows 和 Mac
+
+先安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/) 和 Git，然后从第 2 步开始照做。命令前不需要加 `sudo`，也不需要 SSH 隧道，直接在本机浏览器打开 WebUI。
+
+### 补充说明
+
 - 两个容器通过 compose 内部网络通信，OneBot 的 3001 端口不会暴露到宿主机。
 - 宿主机不需要 X11 或 Wayland：NapCat 镜像在容器内部自带虚拟显示（Xvfb）。
 - 要使用宿主机上的 Ollama，把 `llm.baseUrl` 设为 `http://host.docker.internal:11434/v1`。
