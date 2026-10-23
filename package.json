@@ -1,6 +1,6 @@
 {
   "name": "napcat-ai-forward",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Forward QQ messages from NapCat (OneBot 11) to any OpenAI-compatible chat API",
   "type": "module",
@@ -8,10 +8,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "start": "node bridge.mjs",
-    "test": "node --test"
+    "start": "node src/index.mjs config.json",
+    "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.31.0",
     "ws": "^8.22.0"
   }
 }

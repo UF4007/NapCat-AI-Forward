@@ -1,89 +1,175 @@
 # NapCat-AI-Forward
 
-把 QQ 消息转发给任意 **OpenAI 兼容接口**（OpenAI、DeepSeek、通义千问、Kimi、本地 Ollama 等）的超轻量接入层，基于 [NapCat](https://github.com/NapNeko/NapCatQQ) 的 OneBot 11 正向 WebSocket。
+把 QQ 消息转发给任意 **OpenAI 兼容接口**（OpenAI、DeepSeek、通义千问、Kimi、本地 Ollama 等）的轻量接入层，基于 [NapCat](https://github.com/NapNeko/NapCatQQ) 的 OneBot 11 正向 WebSocket。
 
-整个接入层只有一个文件 `bridge.mjs`，约 200 行，**没有任何依赖**，只需要 Node.js 22 或更高版本（使用 Node 内置的 `WebSocket` 和 `fetch`）。
+**运行时没有任何依赖**，只需要 Node.js 22 或更高版本。
+
+## 功能
 
 - **私聊**：每条消息都回复
-- **群聊**：只在机器人被 @ 时回复，并引用原消息；整个群共用一份上下文，每条消息前带上发言人名字
-- **识图**（需开启 `VISION=true`）：把消息里的图片发给模型；回复（引用）一条带图的消息再 @ 机器人，也会带上被引用消息的文字和图片
-- 每个会话保留最近 20 条对话；发送 `/reset` 或 `/重置` 清空上下文
-- 可选的群白名单；自动过滤推理模型输出的 `<think>…</think>`
-- 断线 5 秒后自动重连；模型接口出错时把错误信息回复给用户，并从历史里撤掉这次提问
+- **群聊**：每条消息都看。`auto` 模式下由模型自己决定说话还是沉默；`mention` 模式下只在被 @ 时回复
+- **长期记忆**：上下文变长时，较早的对话会被模型压缩成摘要，存进记忆文件，之后的对话都会带上它；重启后从记忆文件和聊天记录恢复
+- **聊天记录搜索**：通过 MCP 工具，模型可以按关键词、发送者、时间搜索当前会话的历史消息
+- **任意 MCP 服务器**：可以挂载其他 stdio 类型的 MCP 服务器，把它们的工具交给模型使用
+- **识图**（可选）：消息里的图片，以及被回复的那条消息里的图片，都会发给模型
+- 所有配置都写在一个 `config.json` 里
 
-## 识图
+## 目录结构
 
-在 `.env` 里设置 `VISION=true` 即可开启。**模型必须支持图片输入**（例如 GPT-4o、通义千问 VL、Gemini、Ollama 上的视觉模型），纯文字模型收到图片会报错。
+```
+├── config.example.json     配置模板，复制成 config.json 使用
+├── compose.yaml            用 Docker 同时运行 NapCat 和本项目
+├── src/
+│   ├── index.mjs           入口
+│   ├── config.mjs          读取并校验 config.json
+│   ├── onebot.mjs          与 NapCat 的 WebSocket 连接（断线重连、调用接口）
+│   ├── bot.mjs             消息处理：攒批、让模型决定是否回复、发送回复
+│   ├── conversation.mjs    每个会话的上下文与记忆压缩
+│   ├── llm.mjs             调用模型，包括工具调用循环
+│   ├── message.mjs         解析消息、下载图片
+│   ├── store.mjs           聊天记录与记忆文件的读写
+│   ├── mcp-client.mjs      精简的 MCP 客户端（stdio）
+│   └── tools.mjs           把 MCP 工具提供给模型
+├── mcp/
+│   └── chat-history.mjs    聊天记录搜索 MCP 服务器
+├── test/                   测试
+└── data/                   运行时生成（已被 git 忽略）
+    ├── logs/<会话>.jsonl   聊天记录
+    └── memory/<会话>.md    长期记忆
+```
 
-- 图片会先由接入层下载，再以 base64 形式发给模型。QQ 图片链接会过期，而且模型服务商的服务器往往访问不了 QQ 图床，所以不直接转发链接。
-- 每条消息最多处理 4 张图片（包括被引用消息里的），单张不超过 `IMAGE_MAX_MB`（默认 10 MB）。超过限制或下载失败的图片会被跳过，并在提问里注明；如果一张都没加载成功、也没有文字，就直接回复"图片加载失败"，不调用模型。
-- 对话历史里只记"[图片×N]"占位符，不保存图片本身，避免每轮对话都重新发送图片、成倍增加费用。因此追问"刚才那张图"时，模型只记得它的文字回答，看不到图片本身。
-- 表情包（收藏表情、热图、斗图、商城表情等）默认跳过，设置 `VISION_STICKERS=true` 可以一并识别。
-- 关闭识图时，图片会被忽略，和之前的行为一样。
+会话 ID 的格式是 `group-群号` 或 `private-QQ号`。
 
 ## 用 Docker Compose 部署（推荐）
 
-`compose.yaml` 同时启动 NapCat 和 `bridge.mjs`（使用官方 `node:22-alpine` 镜像，不需要构建）。两者通过 compose 内部网络通信，OneBot 的 3001 端口不会暴露到宿主机。
-
 ```bash
-cp .env.example .env     # 填写 WEBUI_TOKEN、LLM_BASE_URL、LLM_API_KEY、LLM_MODEL
+cp config.example.json config.json   # 至少修改 llm.apiKey、llm.model 和 group.allow
 docker compose up -d
+docker compose logs napcat           # 在输出里找到 WebUI 的 token
 ```
 
-然后在浏览器打开 `http://127.0.0.1:6099/webui` 扫码登录 QQ，再用 `docker compose logs -f bridge` 查看接入层日志。
+然后在浏览器打开 `http://127.0.0.1:6099/webui`，输入 token 后扫码登录 QQ。之后可以用 `docker compose logs -f bridge` 查看本项目的日志。
 
+- **一定要先创建 `config.json` 再启动**，否则 Docker 会自动创建一个同名的空目录。
+- NapCat 的登录数据保存在 `data/napcat/`，本项目的聊天记录和记忆保存在 `data/bridge/`。
 - WebUI 只绑定在 `127.0.0.1`。在远程服务器上，可以用 `ssh -L 6099:127.0.0.1:6099 你的服务器` 转发到本地再打开。
-- 要使用宿主机上的 Ollama，把 `LLM_BASE_URL` 设为 `http://host.docker.internal:11434/v1`。
-- NapCat 的 `MODE: ws` 模板默认 **WebSocket token 为空**。建议在 WebUI 的"网络配置"里给名为 `ws` 的 WebSocket 服务端设置一个 token，并在 `.env` 里填上相同的 `ONEBOT_TOKEN`。
+- 两个容器通过 compose 内部网络通信，OneBot 的 3001 端口不会暴露到宿主机。
 - 宿主机不需要 X11 或 Wayland：NapCat 镜像在容器内部自带虚拟显示（Xvfb）。
+- 要使用宿主机上的 Ollama，把 `llm.baseUrl` 设为 `http://host.docker.internal:11434/v1`。
 
 ## 不用 Docker 直接运行
 
-NapCat 需要开启一个 WebSocket 服务端（消息格式 `array`，这是默认值）。
+NapCat 需要开启一个 WebSocket 服务端（消息格式 `array`，这是默认值）。把 `config.json` 里的 `onebot.url` 改成 `ws://127.0.0.1:3001`，然后：
 
 ```bash
-ONEBOT_WS=ws://127.0.0.1:3001 LLM_BASE_URL=https://api.deepseek.com/v1 \
-LLM_API_KEY=sk-xxx LLM_MODEL=deepseek-chat node bridge.mjs
+node src/index.mjs config.json
 ```
 
-## 配置项
+## 配置说明
 
-| 环境变量 | 默认值 | 说明 |
+完整示例见 [`config.example.json`](config.example.json)。没写的配置项会使用下面的默认值。文件里的相对路径都以 `config.json` 所在目录为基准。
+
+| 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `ONEBOT_WS` | `ws://127.0.0.1:3001` | NapCat 的 WebSocket 服务端地址 |
-| `ONEBOT_TOKEN` | 空 | 与 NapCat 中设置的 token 一致 |
-| `LLM_BASE_URL` | `https://api.openai.com/v1` | OpenAI 兼容接口地址，会请求 `{LLM_BASE_URL}/chat/completions` |
-| `LLM_API_KEY` | 空 | 接口密钥 |
-| `LLM_MODEL` | `gpt-4o-mini` | 模型名 |
-| `SYSTEM_PROMPT` | `你是一个简洁友好的 QQ 助手。` | 系统提示词 |
-| `HISTORY_MESSAGES` | `20` | 每个会话保留的最近消息条数 |
-| `ALLOW_GROUPS` | 空（所有群） | 允许回复的群号，用逗号分隔 |
-| `VISION` | `false` | 设为 `true` 开启识图，模型需支持图片输入 |
-| `VISION_STICKERS` | `false` | 设为 `true` 时连表情包一起识别 |
-| `IMAGE_MAX_MB` | `10` | 单张图片的大小上限（MB） |
+| `onebot.url` | `ws://127.0.0.1:3001` | NapCat 的 WebSocket 服务端地址；Docker 部署时为 `ws://napcat:3001` |
+| `onebot.token` | 空 | 与 NapCat 中设置的 token 一致 |
+| `llm.baseUrl` | `https://api.openai.com/v1` | OpenAI 兼容接口地址，会请求 `{baseUrl}/chat/completions` |
+| `llm.apiKey` | 空 | 接口密钥 |
+| `llm.model` | `gpt-4o-mini` | 模型名 |
+| `llm.timeoutSeconds` | `120` | 单次请求超时 |
+| `llm.maxToolRounds` | `5` | 每次回复最多连续调用几轮工具 |
+| `bot.name` | 空 | 机器人的名字，会写进提示词，群友叫这个名字时模型更容易接话 |
+| `bot.systemPrompt` | `你是一个简洁友好的 QQ 助手。` | 系统提示词（人设） |
+| `private.enabled` | `true` | 是否回复私聊 |
+| `private.allow` | `[]` | 允许私聊的 QQ 号；空表示所有人 |
+| `group.reply` | `auto` | `auto`：由模型决定是否回复；`mention`：只在被 @ 时回复 |
+| `group.allow` | `[]` | 生效的群号；**空表示所有群** |
+| `group.debounceSeconds` | `8` | 群里安静这么多秒后，把攒下的消息一起交给模型 |
+| `group.maxWaitSeconds` | `30` | 群里一直有人说话时，最多攒这么久就处理一次 |
+| `vision.enabled` | `false` | 是否识图，模型需要支持图片输入 |
+| `vision.stickers` | `false` | 是否连表情包一起识别 |
+| `vision.maxImages` | `4` | 每批消息最多处理几张图片 |
+| `vision.maxImageMB` | `10` | 单张图片的大小上限 |
+| `memory.maxContextMessages` | `40` | 上下文超过这么多条时触发压缩 |
+| `memory.keepRecentMessages` | `10` | 压缩时保留最近这么多条原文，其余写进记忆；重启后也从聊天记录里恢复这么多条 |
+| `memory.maxMemoryChars` | `2000` | 记忆摘要的长度上限（字） |
+| `timezone` | 系统时区 | 提示词和聊天记录搜索使用的时区，例如 `Asia/Shanghai` |
+| `dataDir` | `data` | 聊天记录和记忆文件的存放目录 |
+| `mcpServers` | `{}` | 要挂载的 MCP 服务器，见下文 |
+
+## 群聊是怎么工作的
+
+每条消息都会记进聊天记录和上下文。群里安静 `debounceSeconds` 秒后（或者最多攒 `maxWaitSeconds` 秒），这一批消息会以"昵称(QQ号)：内容"的格式一起交给模型。有人 @ 机器人时立即处理，回复时会引用那条消息。
+
+- **`auto` 模式**：提示词会告诉模型，只有被 @、被叫名字、被提问，或者确实有价值的内容可以补充时才发言，否则输出 `[NO_REPLY]`。接入层收到 `[NO_REPLY]` 就保持沉默。**注意：这个模式下每一批群消息都会调用一次模型，群越活跃费用越高**，建议用 `group.allow` 限定群，并适当调大 `debounceSeconds`。
+- **`mention` 模式**：普通消息只记录、不调用模型；被 @ 时，模型能看到之前的群聊内容再回答。
+
+## 长期记忆
+
+- 上下文超过 `memory.maxContextMessages` 条时，较早的部分（只保留最近 `keepRecentMessages` 条）会连同已有记忆一起交给模型，整理成一份新的记忆，写入 `data/memory/<会话>.md`。之后每次对话，记忆都会附在系统提示词里。
+- 记忆文件是普通的 Markdown 文本，可以直接查看、修改或删除。
+- 重启后，记忆从文件读回，最近的上下文从聊天记录 `data/logs/<会话>.jsonl` 的末尾恢复。
+- 压缩失败时会在下次再试；上下文超过上限的两倍时会丢弃最旧的部分，防止无限增长。
+
+## MCP 工具
+
+`mcpServers` 的写法与常见的 MCP 客户端一致，每一项都会作为子进程启动（目前只支持 stdio 类型）：
+
+```json
+"mcpServers": {
+  "chat_history": {
+    "command": "node",
+    "args": ["mcp/chat-history.mjs", "config.json"],
+    "conversationArgument": "conversation"
+  }
+}
+```
+
+- 每个工具都会以 `服务器名__工具名` 的名字提供给模型，可选的 `env` 字段可以给子进程传环境变量。
+- **`conversationArgument`**：指定工具的某个参数由接入层强制填写为当前会话 ID，并且不让模型看到这个参数。内置的聊天记录搜索就靠它保证**模型只能搜到当前会话的记录**，在 A 群里查不到 B 群或私聊的内容。
+- 使用工具需要模型支持函数调用（OpenAI 的 `tools` 参数）。如果你的模型不支持，把 `mcpServers` 设为 `{}` 即可。
+- 某个 MCP 服务器启动失败时，只会在日志里报错，不影响其他功能。
+
+内置的 `mcp/chat-history.mjs` 提供一个 `search_chat_history` 工具，可以按关键词（多个词用空格分隔，需全部包含）、发送者 QQ 号、起止时间筛选，返回最新的若干条匹配消息。它读取同一份 `config.json` 来找到数据目录和时区，也可以单独给其他 MCP 客户端使用（这时不指定会话就会搜索全部会话）。
+
+## 识图
+
+把 `vision.enabled` 设为 `true` 即可开启。**模型必须支持图片输入**（例如 GPT-4o、通义千问 VL、Gemini、Ollama 上的视觉模型），纯文字模型收到图片会报错。
+
+- 图片由接入层下载后，以 base64 形式发给模型。QQ 图片链接会过期，而且模型服务商往往访问不了 QQ 图床，所以不直接转发链接。
+- 回复（引用）一条带图的消息，模型也能看到那张图。
+- 下载失败或超过大小限制的图片会被跳过，并在提问里注明。
+- 上下文和记忆里只保留"[图片]"占位符，不保存图片本身。因此追问"刚才那张图"时，模型只记得自己之前的描述。
+- 表情包（收藏表情、热图、斗图、商城表情等）默认跳过。
+
+## 命令
+
+- `/reset` 或 `/重置`：清空当前会话的短期上下文（群里需要 @ 机器人）。长期记忆和聊天记录不受影响，要彻底遗忘请删除对应的记忆文件。
 
 ## 测试
 
-`test/bridge.test.mjs` 会启动一个模拟的 NapCat（OneBot 11 WebSocket 服务端）和一个模拟的 OpenAI 接口，然后运行 `bridge.mjs` 并检查它的行为。测试需要开发依赖 `ws`（只用来搭建模拟服务端，`bridge.mjs` 本身不依赖它）：
+测试会启动模拟的 NapCat、模拟的模型接口和模拟的图床，再运行本项目检查行为。开发依赖（`ws` 和官方 MCP SDK）只用于测试，运行本项目不需要它们：
 
 ```bash
 npm install
 npm test
 ```
 
-覆盖的行为：@ 判断、私聊、群白名单、`/reset`、过滤思考内容、token 传递、接口报错时的回复与历史回滚、断线重连；识图方面包括图片转 base64 及格式识别、通过 `get_msg` 取回被引用消息的图片、跳过表情包、大小限制、历史里只存占位符，以及关闭识图时不下载图片。
+覆盖的内容：私聊、`/reset`、错误处理与断线重连；群聊攒批、模型选择沉默或发言、@ 立即回复、群白名单、`mention` 模式；识图（格式识别、被引用消息的图片、跳过表情包、大小限制、上下文只存占位符）；记忆压缩与重启恢复；聊天记录搜索的各种筛选、与官方 MCP SDK 的双向互通，以及模型通过工具搜索时被限定在当前会话。
 
 这些测试没有连接真实的 QQ。首次部署建议先用小号在测试群里试用。
 
 ## 限制
 
-- 只处理文字和图片，语音、视频、文件等其他内容会被忽略
+- 只处理文字和图片，语音、视频、文件等会显示为占位符
 - 不支持流式输出
-- 对话历史保存在内存中，重启后丢失
+- MCP 只支持 stdio 类型的服务器
+- 聊天记录搜索是逐行扫描文件，适合个人或小规模使用
 
-## 风险提示
+## 风险与隐私
 
-NapCat 不是腾讯官方支持的接入方式，使用它违反 QQ 用户协议，账号有被限制或封禁的风险。请使用小号。聊天内容会发送给你配置的模型服务商。
+- NapCat 不是腾讯官方支持的接入方式，使用它违反 QQ 用户协议，账号有被限制或封禁的风险。请使用小号。
+- 本项目会把生效群里的**所有消息**保存到本地聊天记录，并发送给你配置的模型服务商。请告知群成员，并妥善保管 `data/` 目录。
 
 ## 为什么不写成 NapCat 插件
 

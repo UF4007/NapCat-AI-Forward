@@ -1,0 +1,47 @@
+{
+  "onebot": {
+    "url": "ws://napcat:3001",
+    "token": ""
+  },
+  "llm": {
+    "baseUrl": "https://api.openai.com/v1",
+    "apiKey": "sk-xxx",
+    "model": "gpt-4o-mini",
+    "timeoutSeconds": 120,
+    "maxToolRounds": 5
+  },
+  "bot": {
+    "name": "小助手",
+    "systemPrompt": "你是一个简洁友好的 QQ 助手。"
+  },
+  "private": {
+    "enabled": true,
+    "allow": []
+  },
+  "group": {
+    "reply": "auto",
+    "allow": [123456789],
+    "debounceSeconds": 8,
+    "maxWaitSeconds": 30
+  },
+  "vision": {
+    "enabled": false,
+    "stickers": false,
+    "maxImages": 4,
+    "maxImageMB": 10
+  },
+  "memory": {
+    "maxContextMessages": 40,
+    "keepRecentMessages": 10,
+    "maxMemoryChars": 2000
+  },
+  "timezone": "Asia/Shanghai",
+  "dataDir": "data",
+  "mcpServers": {
+    "chat_history": {
+      "command": "node",
+      "args": ["mcp/chat-history.mjs", "config.json"],
+      "conversationArgument": "conversation"
+    }
+  }
+}
