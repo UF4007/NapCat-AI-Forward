@@ -93,7 +93,7 @@ export class Bot {
       return chat.thread.run(() => {
         chat.thread.context = [];
         chat.pending = [];
-        this.reply(chat, '上下文已清空。', msg.id, { remember: false });
+        this.reply(chat, '上下文已清空。', chat.isGroup ? msg.id : undefined, { remember: false });
       });
     }
     chat.pending.push(msg);
@@ -189,7 +189,11 @@ export class Bot {
     }
 
     if (this.global && reply) reply = reply.replace(LEADING_LABEL, '');
-    const quote = chat.isGroup ? mention?.id : batch.at(-1).id;
+    // In a group the reply quotes the latest @-mention. In a private chat it quotes the last message only when it
+    // would otherwise be unclear what it answers: several messages were answered at once, or newer ones arrived
+    // while the model was busy.
+    const unclear = pending.length > 1 || chat.pending.length > 0;
+    const quote = chat.isGroup ? mention?.id : unclear ? batch.at(-1).id : undefined;
     if (error) {
       console.error(`LLM request failed for ${chat.key}: ${error.message}`);
       if (!chat.isGroup) thread.context.pop(); // so the user can simply ask again

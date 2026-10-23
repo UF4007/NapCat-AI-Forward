@@ -15,7 +15,7 @@ test('private chat: replies with context, /reset clears it, and no chat history 
   await waitUntil(() => mocks.actions.length === 1);
   assert.equal(mocks.actions[0].action, 'send_private_msg');
   assert.equal(mocks.actions[0].params.user_id, 42);
-  assert.equal(quotedId(mocks.actions[0]), '1');
+  assert.equal(quotedId(mocks.actions[0]), undefined, 'a reply to a single message needs no quote');
   assert.equal(replyText(mocks.actions[0]), '回答:你好[图片]'); // <think> stripped
   assert.deepEqual(mocks.fileHits, []);
 
@@ -32,6 +32,7 @@ test('private chat: replies with context, /reset clears it, and no chat history 
   mocks.send(message('private', '/reset', { id: 3 }));
   await waitUntil(() => mocks.actions.length === 3);
   assert.equal(replyText(mocks.actions[2]), '上下文已清空。');
+  assert.equal(quotedId(mocks.actions[2]), undefined);
   mocks.send(message('private', '新问题', { id: 4 }));
   await waitUntil(() => mocks.actions.length === 4);
   assert.equal(mocks.llmCalls.length, 3, '/reset does not call the model');
@@ -40,6 +41,31 @@ test('private chat: replies with context, /reset clears it, and no chat history 
   // the first message looked for earlier history in QQ (there was none besides itself)
   assert.deepEqual(mocks.historyCalls.map((r) => [r.action, r.params.user_id]), [['get_friend_msg_history', '42']]);
   assert.deepEqual(listFiles(join(dirname(config), 'data')), [], 'chat history stays in QQ');
+});
+
+test('private chat: quotes only when several messages are answered at once, or newer ones arrived meanwhile', async (t) => {
+  const mocks = await startMocks({
+    llm: async (body, n) => {
+      if (n === 1) await sleep(800);
+      return chat(`回答:${lastUserText(body)}`);
+    },
+  });
+  t.after(mocks.close);
+  await startBridge(t, mocks, writeConfig(mocks));
+
+  mocks.send(message('private', '第一条', { id: 1 }));
+  await waitUntil(() => mocks.llmCalls.length === 1);
+  mocks.send(message('private', '第二条', { id: 2 })); // both arrive while the first request is running
+  mocks.send(message('private', '第三条', { id: 3 }));
+  await waitUntil(() => mocks.actions.length === 2);
+  assert.deepEqual(mocks.actions.map((a) => [replyText(a), quotedId(a)]), [
+    ['回答:第一条', '1'], // newer messages had arrived by the time it was answered
+    ['回答:第二条\n第三条', '3'], // two messages answered at once
+  ]);
+
+  mocks.send(message('private', '第四条', { id: 4 }));
+  await waitUntil(() => mocks.actions.length === 3);
+  assert.equal(quotedId(mocks.actions[2]), undefined);
 });
 
 test('private chat: reports LLM errors without keeping the failed question, and reconnects after a drop', async (t) => {
